@@ -1,0 +1,46 @@
+import express from "express";
+import auth from "../middleware/auth.js";
+import { searchUsers, listContacts, getProfile, updateProfile, uploadAvatar, listOnlineUsers, removeFriend, recommendFriends, getUserBasic, getUserPublicProfile, toggleProfileLike, listProfileLikers, listBlockedUsers, blockUser, unblockUser, listNotifications, markAllNotificationsRead, getChateableUsers, getFollowersList, getFollowingList, updatePushToken, clearPushToken, getMyPushTokenStatus, deactivateAccount, deleteAccount, updateMyLocation, listNearbyUsers } from "../controllers/users.controller.js";
+import { followUser, unfollowUser, getFollowRequests, acceptFollowRequest, rejectFollowRequest, removeFollower } from "../controllers/follow.controller.js";
+import { uploadEncryptionPublicKey, getEncryptionPublicKey } from "../controllers/encryption.controller.js";
+import { upload } from "../middleware/upload.js";
+
+const router = express.Router();
+
+router.post("/push-token", auth, updatePushToken);
+router.post("/push-token/clear", auth, clearPushToken);
+router.get("/push-token/status", auth, getMyPushTokenStatus);
+router.get("/search", auth, searchUsers);
+router.get("/chateable", auth, getChateableUsers);
+router.get("/notifications", auth, listNotifications);
+router.post("/notifications/read-all", auth, markAllNotificationsRead);
+router.patch("/location", auth, updateMyLocation);
+router.get("/nearby", auth, listNearbyUsers);
+router.get("/contacts", auth, listContacts);
+router.delete("/contacts/:userId", auth, removeFriend);
+router.get("/me", auth, getProfile);
+router.patch("/me", auth, updateProfile);
+router.post("/me/avatar", auth, upload.single('avatar'), uploadAvatar);
+router.post("/me/deactivate", auth, deactivateAccount);
+router.delete("/me", auth, deleteAccount);
+router.get("/online", auth, listOnlineUsers);
+router.get("/recommend", auth, recommendFriends);
+router.get("/basic/:userId", auth, getUserBasic);
+router.get("/profile/:userId", auth, getUserPublicProfile);
+router.post("/profile/:userId/like", auth, toggleProfileLike);
+router.get("/profile/:userId/likes", auth, listProfileLikers);
+router.get("/profile/:userId/followers", auth, getFollowersList);
+router.get("/profile/:userId/following", auth, getFollowingList);
+router.post("/:userId/followers/:followerId/remove", auth, removeFollower);
+router.get("/blocked", auth, listBlockedUsers);
+router.post("/block/:userId", auth, blockUser);
+router.delete("/block/:userId", auth, unblockUser);
+router.post("/:targetUserId/follow", auth, followUser);
+router.post("/:targetUserId/unfollow", auth, unfollowUser);
+router.get("/:userId/follow-requests", auth, getFollowRequests);
+router.post("/:userId/follow-requests/:requesterId/accept", auth, acceptFollowRequest);
+router.post("/:userId/follow-requests/:requesterId/reject", auth, rejectFollowRequest);
+router.post("/me/encryption-key", auth, uploadEncryptionPublicKey);
+router.get("/:id/public-key", auth, getEncryptionPublicKey);
+
+export default router;
