@@ -74,12 +74,25 @@ function newJti() {
 
 function signWebAccessToken(userId) {
   const { accessTtl } = getWebAuthConfig();
-  return jwt.sign({ id: userId, typ: "access" }, process.env.JWT_SECRET, { expiresIn: accessTtl });
+  const options = { expiresIn: accessTtl };
+  if (process.env.JWT_ISSUER) options.issuer = process.env.JWT_ISSUER;
+  if (process.env.JWT_AUDIENCE) options.audience = process.env.JWT_AUDIENCE;
+  return jwt.sign({ id: userId, typ: "access" }, process.env.JWT_SECRET, options);
 }
 
 function signWebRefreshToken(userId) {
   const { refreshDays, refreshSecret } = getWebAuthConfig();
-  return jwt.sign({ id: userId, typ: "refresh", jti: newJti() }, refreshSecret, { expiresIn: `${refreshDays}d` });
+  const options = { expiresIn: `${refreshDays}d` };
+  if (process.env.JWT_ISSUER) options.issuer = process.env.JWT_ISSUER;
+  if (process.env.JWT_AUDIENCE) options.audience = process.env.JWT_AUDIENCE;
+  return jwt.sign({ id: userId, typ: "refresh", jti: newJti() }, refreshSecret, options);
+}
+
+function signMobileToken(userId) {
+  const options = { expiresIn: "120d" };
+  if (process.env.JWT_ISSUER) options.issuer = process.env.JWT_ISSUER;
+  if (process.env.JWT_AUDIENCE) options.audience = process.env.JWT_AUDIENCE;
+  return jwt.sign({ id: userId }, process.env.JWT_SECRET, options);
 }
 
 function safeUserShape(user) {
@@ -441,7 +454,7 @@ export const onboardingComplete = async (req, res) => {
 
     await OnboardingDraft.deleteOne({ _id: draft._id }).catch(() => {});
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "120d" });
+    const token = signMobileToken(user._id);
     const safeUser = {
       _id: user._id,
       name: user.name,
@@ -507,7 +520,7 @@ export const login = async (req, res) => {
     user.lastActiveAt = new Date();
     user.save().catch(() => {});
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "120d" });
+    const token = signMobileToken(user._id);
     const safeUser = { _id: user._id, name: user.name, email: user.email, verified: user.verified, nickname: user.nickname };
     return res.status(200).json({ token, user: safeUser });
   } catch (error) {
@@ -626,7 +639,7 @@ export const verifyEmailOtp = async (req, res) => {
     user.emailVerificationOTP = null;
     user.emailVerificationOTPExpires = null;
     await user.save();
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "120d" });
+    const token = signMobileToken(user._id);
     const safeUser = { _id: user._id, name: user.name, email: user.email, verified: user.verified, nickname: user.nickname };
     res.status(200).json({ message: "Email verified successfully", token, user: safeUser });
   } catch (error) {
