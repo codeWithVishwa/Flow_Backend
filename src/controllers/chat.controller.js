@@ -5,11 +5,15 @@ import User from "../models/user.model.js";
 import GroupInvite from "../models/groupInvite.model.js";
 import Post from "../models/post.model.js";
 import crypto from "crypto";
-import { getIO, getOnlineUsers, getSocketIdsForUser } from "../socket.js";
+import { emitMessageDeliveredReceipt, getIO, getOnlineUsers, getSocketIdsForUser } from "../socket.js";
 import { sendPushNotification } from "../utils/expoPush.js";
 import { buildMessageNotifyPayload, enqueuePendingMessageNotification } from "../utils/messageNotifications.js";
 import { decideChatPush } from "../utils/chatPushThrottle.js";
 import cloudinary from "cloudinary";
+
+const MESSAGE_LIMIT_DEFAULT = 30;
+const MESSAGE_LIMIT_MAX = 100;
+const CHAT_MESSAGE_SELECT = "text type mediaUrl mediaDuration post sharedProfile replyTo sender receiver createdAt deleted deletedAt readBy deliveredTo clientMessageId ciphertext nonce payloadType";
 
 function ensureCloudinaryConfigured() {
   const cfg = cloudinary.v2.config();
@@ -91,6 +95,242 @@ function toAbsoluteUrl(url) {
   const base = process.env.APP_BASE_URL || process.env.BASE_URL;
   if (!base) return url;
   return `${String(base).replace(/\/$/, "")}/${url.replace(/^\//, "")}`;
+}
+
+function clampMessageLimit(limit) {
+  const parsed = Number(limit);
+  if (!Number.isFinite(parsed) || parsed <= 0) return MESSAGE_LIMIT_DEFAULT;
+  return Math.max(1, Math.min(MESSAGE_LIMIT_MAX, Math.floor(parsed)));
+}
+
+function normalizeClientMessageId(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (!normalized) return null;
+  return normalized.slice(0, 160);
+}
+
+function encodeMessageCursor(message) {
+  if (!message?._id || !message?.createdAt) return null;
+  try {
+    return Buffer.from(
+      JSON.stringify({
+        id: String(message._id),
+        at: new Date(message.createdAt).toISOString(),
+      })
+    ).toString("base64url");
+  } catch {
+    return null;
+  }
+}
+
+function decodeMessageCursor(cursor) {
+  if (!cursor || typeof cursor !== "string") return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (!mongoose.Types.ObjectId.isValid(parsed?.id)) return null;
+    const at = new Date(parsed?.at);
+    if (Number.isNaN(at.getTime())) return null;
+    return { id: new mongoose.Types.ObjectId(parsed.id), at };
+  } catch {
+    return null;
+  }
+}
+
+function buildBeforeCursorCondition(cursor) {
+  if (!cursor?.id || !cursor?.at) return null;
+  return {
+    $or: [
+      { createdAt: { $lt: cursor.at } },
+      { createdAt: cursor.at, _id: { $lt: cursor.id } },
+    ],
+  };
+}
+
+function buildAfterCursorCondition(cursor) {
+  if (!cursor?.id || !cursor?.at) return null;
+  return {
+    $or: [
+      { createdAt: { $gt: cursor.at } },
+      { createdAt: cursor.at, _id: { $gt: cursor.id } },
+    ],
+  };
+}
+
+function buildMessageQuery({ conversationId, clearedAt, before, beforeCursor, after, afterCursor }) {
+  const filters = [{ conversation: conversationId }];
+  if (clearedAt) {
+    filters.push({ createdAt: { $gte: clearedAt } });
+  }
+  if (before) {
+    const beforeDate = new Date(before);
+    if (!Number.isNaN(beforeDate.getTime())) {
+      filters.push({ createdAt: { $lt: beforeDate } });
+    }
+  }
+  const decodedBefore = decodeMessageCursor(beforeCursor);
+  const beforeCondition = buildBeforeCursorCondition(decodedBefore);
+  if (beforeCondition) filters.push(beforeCondition);
+
+  if (after) {
+    const afterDate = new Date(after);
+    if (!Number.isNaN(afterDate.getTime())) {
+      filters.push({ createdAt: { $gt: afterDate } });
+    }
+  }
+  const decodedAfter = decodeMessageCursor(afterCursor);
+  const afterCondition = buildAfterCursorCondition(decodedAfter);
+  if (afterCondition) filters.push(afterCondition);
+
+  if (filters.length === 1) return filters[0];
+  return { $and: filters };
+}
+
+function addRealtimeSenderFallbacks(messageToSend) {
+  if (messageToSend?.sender && typeof messageToSend.sender === "object") {
+    messageToSend.senderName = messageToSend.sender.nickname || messageToSend.sender.name;
+    messageToSend.senderAvatarUrl = messageToSend.sender.avatarUrl;
+  }
+  return messageToSend;
+}
+
+async function applyRecipientMessagePrivacy(messageToSend, recipientId) {
+  if (!messageToSend) return messageToSend;
+  addRealtimeSenderFallbacks(messageToSend);
+  if (messageToSend.type === "post" && (!messageToSend.post || messageToSend.post?.isDelete)) {
+    messageToSend.post = { unavailable: true, unavailableReason: "deleted" };
+    return messageToSend;
+  }
+  if (
+    messageToSend.post &&
+    messageToSend.post.visibility === "private" &&
+    String(messageToSend.post.author?._id || "") !== String(recipientId || "")
+  ) {
+    const isFollowing = await User.exists({
+      _id: messageToSend.post.author._id,
+      followers: recipientId,
+    });
+    if (!isFollowing) {
+      messageToSend.post = { unavailable: true, unavailableReason: "private" };
+    }
+  }
+  return messageToSend;
+}
+
+async function populateChatMessage(message, { postDoc, sharedProfileDoc, replyMessageDoc } = {}) {
+  await message.populate({ path: "sender", select: "_id name nickname avatarUrl" });
+  if (postDoc || sharedProfileDoc || replyMessageDoc) {
+    const populateOps = [];
+    if (postDoc) {
+      populateOps.push({
+        path: "post",
+        select: "caption media author visibility",
+        populate: { path: "author", select: "name avatarUrl" },
+      });
+    }
+    if (sharedProfileDoc) {
+      populateOps.push({ path: "sharedProfile", select: "name nickname avatarUrl isPrivate" });
+    }
+    if (replyMessageDoc) {
+      populateOps.push({
+        path: "replyTo",
+        select: "text type mediaUrl sender deleted createdAt",
+        populate: { path: "sender", select: "_id name nickname avatarUrl" },
+      });
+    }
+    await message.populate(populateOps);
+  }
+  return message;
+}
+
+async function broadcastChatMessage({ convo, message, actor, conversationId, previewText }) {
+  const io = getIO();
+  const onlineUsers = getOnlineUsers();
+  if (!io) return;
+
+  const senderId = String(actor._id);
+  const senderMessageToSend = addRealtimeSenderFallbacks(message.toObject());
+  io.to(`user:${senderId}`).emit("message:new", { conversationId, message: senderMessageToSend });
+
+  const recipients = (convo.participants || []).filter((p) => String(p) !== senderId);
+  for (const rid of recipients) {
+    const recipientId = String(rid);
+    const messageToSend = await applyRecipientMessagePrivacy(message.toObject(), recipientId);
+    io.to(`user:${recipientId}`).emit("message:new", { conversationId, message: messageToSend });
+
+    const socketIds = getSocketIdsForUser(recipientId);
+    const isOnline = socketIds.length > 0 || onlineUsers.has(recipientId);
+    if (isOnline) {
+      emitMessageDeliveredReceipt({
+        conversationId,
+        messageIds: [message._id],
+        recipientId,
+        senderId,
+      });
+    }
+
+    const senderUsername = actor.nickname || actor.name || "";
+    const senderAvatarUrl = toAbsoluteUrl(actor.avatarUrl) || null;
+    const notifyPayload = buildMessageNotifyPayload({
+      senderId: actor._id,
+      senderUsername,
+      senderAvatarUrl,
+      conversationId,
+      lastMessage: previewText,
+      createdAt: message.createdAt,
+    });
+
+    if (isOnline) {
+      if (socketIds.length) {
+        socketIds.forEach((sid) => io.to(sid).emit("message:notify", notifyPayload));
+      } else {
+        io.to(`user:${recipientId}`).emit("message:notify", notifyPayload);
+      }
+      continue;
+    }
+
+    await enqueuePendingMessageNotification({
+      userId: recipientId,
+      fromUserId: actor._id,
+      conversationId,
+      previewText: notifyPayload.lastMessage,
+    });
+
+    try {
+      const recipient = await User.findById(recipientId).select("pushToken");
+      if (!recipient?.pushToken) continue;
+      const pushDecision = await decideChatPush({
+        userId: recipientId,
+        fromUserId: actor._id,
+        conversationId,
+        previewText: notifyPayload.lastMessage,
+      });
+      if (!pushDecision.send) continue;
+
+      const pushBody = pushDecision.suppressedSinceLastSend > 0
+        ? `${pushDecision.suppressedSinceLastSend + 1} new messages: ${notifyPayload.lastMessage}`
+        : notifyPayload.lastMessage;
+
+      await sendPushNotification(
+        recipient.pushToken,
+        senderUsername || "New message",
+        pushBody,
+        {
+          conversationId,
+          senderId: String(actor._id),
+          type: "chat_message",
+          senderUsername,
+          senderAvatarUrl,
+        },
+        {
+          collapseId: `chat:${conversationId}`,
+          threadId: `chat:${conversationId}`,
+          categoryId: "chat_message",
+          image: senderAvatarUrl,
+        }
+      );
+    } catch {}
+  }
 }
 
 async function upsertDirectConversation(userId, otherId) {
@@ -670,7 +910,13 @@ export const unfavoriteConversation = async (req, res) => {
 export const listMessages = async (req, res) => {
   try {
     const { conversationId } = req.params;
-    const { before, limit = 30 } = req.query;
+    const {
+      before,
+      beforeCursor,
+      after,
+      afterCursor,
+      limit = MESSAGE_LIMIT_DEFAULT,
+    } = req.query;
     const convo = await Conversation.findById(conversationId);
     if (!convo || !convo.participants.some((p) => String(p) === String(req.user._id))) {
       return res.status(404).json({ message: "Conversation not found" });
@@ -683,19 +929,24 @@ export const listMessages = async (req, res) => {
         if (blockStatus.blocked) return res.status(403).json({ message: blockStatus.message });
       }
     }
-    const q = { conversation: conversationId };
     const clearedAt = Array.isArray(convo.clearedFor)
       ? convo.clearedFor.find((entry) => String(entry.user) === String(req.user._id))?.clearedAt
       : null;
-    const createdAt = {};
-    if (clearedAt) createdAt.$gte = clearedAt;
-    if (before) createdAt.$lt = new Date(before);
-    if (Object.keys(createdAt).length) q.createdAt = createdAt;
-    
-    let msgs = await Message.find(q)
-      .sort({ createdAt: -1 })
-      .limit(Number(limit))
-      .select("text type mediaUrl mediaDuration post sharedProfile replyTo sender receiver createdAt deleted deletedAt readBy ciphertext nonce payloadType")
+    const query = buildMessageQuery({
+      conversationId,
+      clearedAt,
+      before,
+      beforeCursor,
+      after,
+      afterCursor,
+    });
+    const isDeltaSync = Boolean(after || afterCursor);
+    const safeLimit = clampMessageLimit(limit);
+
+    let msgs = await Message.find(query)
+      .sort(isDeltaSync ? { createdAt: 1, _id: 1 } : { createdAt: -1, _id: -1 })
+      .limit(safeLimit)
+      .select(CHAT_MESSAGE_SELECT)
       .populate({ path: "sender", select: "name nickname avatarUrl isVerified verificationType" })
       .populate({
         path: "post",
@@ -710,11 +961,11 @@ export const listMessages = async (req, res) => {
       })
       .lean();
 
-    msgs = msgs.reverse();
+    const orderedMessages = isDeltaSync ? msgs : msgs.slice().reverse();
 
     // If a shared post was deleted/removed, represent it as unavailable.
     // This mirrors Instagram-style behavior: keep the message bubble, but show an unavailable card.
-    for (const msg of msgs) {
+    for (const msg of orderedMessages) {
       if (msg.type === 'post') {
         if (!msg.post || msg.post?.isDelete) {
           msg.post = { unavailable: true, unavailableReason: 'deleted' };
@@ -726,7 +977,7 @@ export const listMessages = async (req, res) => {
     const viewerId = String(req.user._id);
     const privatePostAuthors = new Set();
 
-    for (const msg of msgs) {
+    for (const msg of orderedMessages) {
       if (msg.post && msg.post.visibility === 'private' && msg.post.author && String(msg.post.author._id) !== viewerId) {
         privatePostAuthors.add(String(msg.post.author._id));
       }
@@ -740,7 +991,7 @@ export const listMessages = async (req, res) => {
       
       const followingSet = new Set(following.map(u => String(u._id)));
 
-      for (const msg of msgs) {
+      for (const msg of orderedMessages) {
         if (msg.post && msg.post.visibility === 'private' && msg.post.author && String(msg.post.author._id) !== viewerId) {
           if (!followingSet.has(String(msg.post.author._id))) {
              msg.post = { unavailable: true, unavailableReason: 'private' };
@@ -749,7 +1000,22 @@ export const listMessages = async (req, res) => {
       }
     }
 
-    res.json({ messages: msgs });
+    const syncCursor = orderedMessages.length
+      ? encodeMessageCursor(orderedMessages[orderedMessages.length - 1])
+      : decodeMessageCursor(afterCursor)
+      ? afterCursor
+      : null;
+    const nextCursor = !isDeltaSync && orderedMessages.length
+      ? encodeMessageCursor(orderedMessages[0])
+      : null;
+
+    res.json({
+      messages: orderedMessages,
+      syncCursor,
+      nextCursor,
+      hasMore: !isDeltaSync && orderedMessages.length === safeLimit,
+      mode: isDeltaSync ? "delta" : "history",
+    });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
@@ -758,8 +1024,34 @@ export const listMessages = async (req, res) => {
 export const sendMessage = async (req, res) => {
   try {
     const { conversationId } = req.params;
-    const { text, payloadType = "text", media, postId, profileId, replyTo } = req.body;
-    if (!text && !media && !postId && !profileId) return res.status(400).json({ message: "Text, media, post, or profile required" });
+    const {
+      text,
+      payloadType: requestedPayloadType = "text",
+      type,
+      media,
+      postId,
+      profileId,
+      replyTo,
+      clientMessageId,
+      ciphertext,
+      nonce,
+      envelope,
+    } = req.body;
+    const payloadType = type || requestedPayloadType || "text";
+    const normalizedCiphertext = typeof ciphertext === "string"
+      ? ciphertext
+      : typeof envelope?.ciphertext === "string"
+      ? envelope.ciphertext
+      : null;
+    const normalizedNonce = typeof nonce === "string"
+      ? nonce
+      : typeof envelope?.nonce === "string"
+      ? envelope.nonce
+      : null;
+    if (!text && !media && !postId && !profileId && !normalizedCiphertext) {
+      return res.status(400).json({ message: "Text, media, post, profile, or ciphertext required" });
+    }
+    const normalizedClientMessageId = normalizeClientMessageId(clientMessageId);
 
     // Validate post share
     let postDoc = null;
@@ -796,6 +1088,30 @@ export const sendMessage = async (req, res) => {
       if (blockStatus.blocked) return res.status(403).json({ message: blockStatus.message });
     }
 
+    if (normalizedClientMessageId) {
+      const existingMessage = await Message.findOne({
+        conversation: conversationId,
+        sender: req.user._id,
+        clientMessageId: normalizedClientMessageId,
+      })
+        .select(CHAT_MESSAGE_SELECT)
+        .populate({ path: "sender", select: "name nickname avatarUrl isVerified verificationType" })
+        .populate({
+          path: "post",
+          select: "caption media author visibility isDelete createdAt",
+          populate: { path: "author", select: "name avatarUrl" }
+        })
+        .populate({ path: "sharedProfile", select: "name nickname avatarUrl isPrivate" })
+        .populate({
+          path: "replyTo",
+          select: "text type mediaUrl sender deleted createdAt",
+          populate: { path: "sender", select: "name nickname avatarUrl" }
+        });
+      if (existingMessage) {
+        return res.status(200).json({ message: existingMessage, duplicate: true });
+      }
+    }
+
     let replyMessageDoc = null;
     if (replyTo) {
       if (!mongoose.Types.ObjectId.isValid(replyTo)) {
@@ -811,10 +1127,24 @@ export const sendMessage = async (req, res) => {
       conversation: conversationId,
       sender: req.user._id,
       receiver: receiverId,
-      text: text || (payloadType === "profile" ? "Shared profile" : ""),
+      text: text || (payloadType === "profile" ? "Shared profile" : ciphertextPreview(normalizedCiphertext) || ""),
       type: payloadType,
+      payloadType,
       readBy: [req.user._id],
+      clientMessageId: normalizedClientMessageId,
     };
+
+    const recipients = convo.participants
+      .map((entry) => String(entry))
+      .filter((entry) => entry !== String(req.user._id));
+    const onlineUsers = getOnlineUsers();
+    const deliveredRecipientIds = recipients.filter((rid) => {
+      const socketIds = getSocketIdsForUser(rid);
+      return socketIds.length > 0 || onlineUsers.has(rid);
+    });
+    if (deliveredRecipientIds.length) {
+      messageData.deliveredTo = deliveredRecipientIds;
+    }
 
     if (postDoc) {
       messageData.post = postDoc._id;
@@ -828,6 +1158,14 @@ export const sendMessage = async (req, res) => {
       messageData.replyTo = replyMessageDoc._id;
     }
 
+    if (normalizedCiphertext) {
+      messageData.ciphertext = normalizedCiphertext;
+    }
+
+    if (normalizedNonce) {
+      messageData.nonce = normalizedNonce;
+    }
+
     // Include media if provided
     if (media && media.url) {
       messageData.mediaUrl = media.url;
@@ -835,162 +1173,27 @@ export const sendMessage = async (req, res) => {
     }
 
     const message = await Message.create(messageData);
-    // Ensure sender identity is available for real-time UI (toast/avatar)
-    await message.populate({ path: "sender", select: "_id name nickname avatarUrl" });
-    if (postDoc || sharedProfileDoc || replyMessageDoc) {
-      const populateOps = [];
-      if (postDoc) {
-        populateOps.push({
-          path: "post",
-          select: "caption media author visibility",
-          populate: { path: "author", select: "name avatarUrl" }
-        });
-      }
-      if (sharedProfileDoc) {
-        populateOps.push({ path: "sharedProfile", select: "name nickname avatarUrl isPrivate" });
-      }
-      if (replyMessageDoc) {
-        populateOps.push({
-          path: "replyTo",
-          select: "text type mediaUrl sender deleted createdAt",
-          populate: { path: "sender", select: "_id name nickname avatarUrl" }
-        });
-      }
-      await message.populate(populateOps);
-    }
+    await populateChatMessage(message, { postDoc, sharedProfileDoc, replyMessageDoc });
+
+    const previewText = text
+      ? text
+      : ciphertextPreview(normalizedCiphertext) || `[${payloadType}]`;
 
     convo.lastMessage = {
-      text: text ? (text.length > 50 ? text.slice(0, 50) + "…" : text) : `[${payloadType}]`,
+      text: previewText.length > 50 ? previewText.slice(0, 50) + "…" : previewText,
       msgType: payloadType,
       sender: req.user._id,
       at: message.createdAt,
     };
     await convo.save();
 
-    const io = getIO();
-    const onlineUsers = getOnlineUsers();
-    
-    if (io) {
-      const senderId = String(req.user._id);
-      const recipients = convo.participants.filter((p) => String(p) !== senderId);
-
-      // Emit message:new back to sender for instant chat screen update
-      const senderMessageToSend = message.toObject();
-      if (senderMessageToSend?.sender && typeof senderMessageToSend.sender === 'object') {
-        senderMessageToSend.senderName = senderMessageToSend.sender.nickname || senderMessageToSend.sender.name;
-        senderMessageToSend.senderAvatarUrl = senderMessageToSend.sender.avatarUrl;
-      }
-      io.to(`user:${senderId}`).emit("message:new", { conversationId, message: senderMessageToSend });
-
-      for (const rid of recipients) {
-        const recipientId = String(rid);
-        
-           // Check privacy for recipient if post is private
-           let messageToSend = message.toObject();
-           // Provide explicit fallbacks for frontend toast rendering
-           if (messageToSend?.sender && typeof messageToSend.sender === 'object') {
-            messageToSend.senderName = messageToSend.sender.nickname || messageToSend.sender.name;
-            messageToSend.senderAvatarUrl = messageToSend.sender.avatarUrl;
-           }
-          if (messageToSend.type === 'post' && (!messageToSend.post || messageToSend.post?.isDelete)) {
-           messageToSend.post = { unavailable: true, unavailableReason: 'deleted' };
-          }
-
-          if (messageToSend.post && messageToSend.post.visibility === 'private' && String(messageToSend.post.author?._id) !== recipientId) {
-           const isFollowing = await User.exists({ _id: messageToSend.post.author._id, followers: recipientId });
-           if (!isFollowing) {
-              messageToSend.post = { unavailable: true, unavailableReason: 'private' };
-           }
-        }
-
-        // 1) Always emit message:new for chat UIs (rooms-based)
-        io.to(`user:${recipientId}`).emit("message:new", { conversationId, message: messageToSend });
-
-        // 2) Instagram-like notification system
-        // - If user is ONLINE: emit message:notify immediately (required payload)
-        // - If user is OFFLINE: persist PendingNotification for delivery on reconnect
-        const socketIds = getSocketIdsForUser(recipientId);
-        const isOnline = socketIds.length > 0 || onlineUsers.has(recipientId);
-        const senderUsername = req.user.nickname || req.user.name || "";
-        const senderAvatarUrl = toAbsoluteUrl(req.user.avatarUrl) || null;
-        const notifyPayload = buildMessageNotifyPayload({
-          senderId: req.user._id,
-          senderUsername,
-          senderAvatarUrl,
-          conversationId,
-          lastMessage: text || `[${payloadType}]`,
-          createdAt: message.createdAt,
-        });
-
-        if (isOnline) {
-          // Debug: push notifications are only sent when recipient is offline.
-          // If you expect a push while the app is "closed" but backend thinks user is online,
-          // this log will confirm the decision path.
-          console.log(`[chat] notify recipient=${recipientId} online=true sockets=${socketIds.length}`);
-          // Requirement says userId -> socketId; we emit to all active sockets for robustness.
-          if (socketIds.length) {
-            socketIds.forEach((sid) => io.to(sid).emit("message:notify", notifyPayload));
-          } else {
-            // Fallback: room-based delivery (should be rare)
-            io.to(`user:${recipientId}`).emit("message:notify", notifyPayload);
-          }
-        } else {
-          console.log(`[chat] notify recipient=${recipientId} online=false sockets=${socketIds.length} -> will enqueue + maybe push`);
-          await enqueuePendingMessageNotification({
-            userId: recipientId,
-            fromUserId: req.user._id,
-            conversationId,
-            previewText: notifyPayload.lastMessage,
-          });
-
-          // Optional: keep existing push notification behavior if token exists.
-          try {
-            const recipient = await User.findById(recipientId).select("pushToken");
-            if (recipient?.pushToken) {
-              const pushDecision = await decideChatPush({
-                userId: recipientId,
-                fromUserId: req.user._id,
-                conversationId,
-                previewText: notifyPayload.lastMessage,
-              });
-              if (!pushDecision.send) {
-                console.log(`[push] throttled recipient=${recipientId} convo=${conversationId} suppressed=${pushDecision.suppressedSinceLastSend}`);
-                continue;
-              }
-
-              const pushBody = pushDecision.suppressedSinceLastSend > 0
-                ? `${pushDecision.suppressedSinceLastSend + 1} new messages: ${notifyPayload.lastMessage}`
-                : notifyPayload.lastMessage;
-
-              const suffix = String(recipient.pushToken).slice(-12);
-              console.log(`[push] attempting recipient=${recipientId} tokenSuffix=${suffix}`);
-              await sendPushNotification(
-                recipient.pushToken,
-                senderUsername || "New message",
-                pushBody,
-                {
-                  conversationId,
-                  senderId: String(req.user._id),
-                  type: "chat_message",
-                  senderUsername,
-                  senderAvatarUrl,
-                }
-                ,
-                {
-                  collapseId: `chat:${conversationId}`,
-                  threadId: `chat:${conversationId}`,
-                  categoryId: 'chat_message',
-                  image: senderAvatarUrl,
-                }
-              );
-              console.log(`[push] sent attempt recipient=${recipientId}`);
-            } else {
-              console.log(`[push] skipped (no token) recipient=${recipientId}`);
-            }
-          } catch {}
-        }
-      }
-    }
+    await broadcastChatMessage({
+      convo,
+      message,
+      actor: req.user,
+      conversationId,
+      previewText,
+    });
 
     res.status(201).json({ message });
   } catch (e) {
@@ -1051,7 +1254,9 @@ export const markRead = async (req, res) => {
       : null;
     const readFilter = { conversation: conversationId, readBy: { $ne: req.user._id } };
     if (clearedAt) readFilter.createdAt = { $gte: clearedAt };
-    await Message.updateMany(readFilter, { $addToSet: { readBy: req.user._id } });
+    await Message.updateMany(readFilter, {
+      $addToSet: { readBy: req.user._id, deliveredTo: req.user._id },
+    });
     const io = getIO();
     const recipients = (convo.participants || []).filter((p) => String(p) !== String(req.user._id));
     recipients.forEach((rid) => {
@@ -1158,8 +1363,9 @@ export const deleteConversationForUser = async (req, res) => {
 
 export const replyFromNotification = async (req, res) => {
   try {
-    const { conversationId, text } = req.body;
+    const { conversationId, text, clientMessageId } = req.body;
     if (!conversationId || !text) return res.status(400).json({ message: "Missing fields" });
+    const normalizedClientMessageId = normalizeClientMessageId(clientMessageId);
 
     const convo = await Conversation.findById(conversationId);
     if (!convo || !convo.participants.some((p) => String(p) === String(req.user._id))) {
@@ -1167,6 +1373,26 @@ export const replyFromNotification = async (req, res) => {
     }
     
     const receiverId = convo.participants.find((p) => String(p) !== String(req.user._id));
+    if (normalizedClientMessageId) {
+      const existingMessage = await Message.findOne({
+        conversation: conversationId,
+        sender: req.user._id,
+        clientMessageId: normalizedClientMessageId,
+      })
+        .select(CHAT_MESSAGE_SELECT)
+        .populate({ path: "sender", select: "name nickname avatarUrl isVerified verificationType" });
+      if (existingMessage) {
+        return res.status(200).json({ message: existingMessage, duplicate: true });
+      }
+    }
+    const recipients = convo.participants
+      .map((entry) => String(entry))
+      .filter((entry) => entry !== String(req.user._id));
+    const onlineUsers = getOnlineUsers();
+    const deliveredRecipientIds = recipients.filter((rid) => {
+      const socketIds = getSocketIdsForUser(rid);
+      return socketIds.length > 0 || onlineUsers.has(rid);
+    });
     
     const messageData = {
       conversation: conversationId,
@@ -1175,11 +1401,14 @@ export const replyFromNotification = async (req, res) => {
       text: text,
       type: "text",
       readBy: [req.user._id],
+      clientMessageId: normalizedClientMessageId,
     };
+    if (deliveredRecipientIds.length) {
+      messageData.deliveredTo = deliveredRecipientIds;
+    }
 
     const message = await Message.create(messageData);
-    // Ensure sender identity is available for real-time UI (toast/avatar)
-    await message.populate({ path: "sender", select: "_id name nickname avatarUrl" });
+    await populateChatMessage(message);
 
     convo.lastMessage = {
       text: text.length > 50 ? text.slice(0, 50) + "…" : text,
@@ -1188,87 +1417,13 @@ export const replyFromNotification = async (req, res) => {
     };
     await convo.save();
 
-    const io = getIO();
-    const onlineUsers = getOnlineUsers();
-    
-    if (io) {
-      const rid = String(receiverId);
-      const senderId = String(req.user._id);
-      const messageToSend = message.toObject();
-      if (messageToSend?.sender && typeof messageToSend.sender === 'object') {
-        messageToSend.senderName = messageToSend.sender.nickname || messageToSend.sender.name;
-        messageToSend.senderAvatarUrl = messageToSend.sender.avatarUrl;
-      }
-      // Always emit message:new for chat UIs (recipient and sender)
-      io.to(`user:${rid}`).emit("message:new", { conversationId, message: messageToSend });
-      io.to(`user:${senderId}`).emit("message:new", { conversationId, message: messageToSend });
-
-      // Instagram-like in-app notification banner
-      const socketIds = getSocketIdsForUser(rid);
-      const isOnline = socketIds.length > 0 || onlineUsers.has(rid);
-      const senderUsername = req.user.nickname || req.user.name || "";
-      const senderAvatarUrl = toAbsoluteUrl(req.user.avatarUrl) || null;
-      const notifyPayload = buildMessageNotifyPayload({
-        senderId: req.user._id,
-        senderUsername,
-        senderAvatarUrl,
-        conversationId,
-        lastMessage: text,
-        createdAt: message.createdAt,
-      });
-
-      if (isOnline) {
-        if (socketIds.length) {
-          socketIds.forEach((sid) => io.to(sid).emit("message:notify", notifyPayload));
-        } else {
-          io.to(`user:${rid}`).emit("message:notify", notifyPayload);
-        }
-      } else {
-        await enqueuePendingMessageNotification({
-          userId: rid,
-          fromUserId: req.user._id,
-          conversationId,
-          previewText: notifyPayload.lastMessage,
-        });
-        try {
-          const recipient = await User.findById(rid).select("pushToken");
-          if (recipient?.pushToken) {
-            const pushDecision = await decideChatPush({
-              userId: rid,
-              fromUserId: req.user._id,
-              conversationId,
-              previewText: notifyPayload.lastMessage,
-            });
-            if (!pushDecision.send) {
-              return;
-            }
-
-            const pushBody = pushDecision.suppressedSinceLastSend > 0
-              ? `${pushDecision.suppressedSinceLastSend + 1} new messages: ${notifyPayload.lastMessage}`
-              : notifyPayload.lastMessage;
-
-            await sendPushNotification(
-              recipient.pushToken,
-              senderUsername || "New message",
-              pushBody,
-              {
-                conversationId,
-                senderId: String(req.user._id),
-                type: "chat_message",
-                senderUsername,
-                senderAvatarUrl,
-              },
-              {
-                collapseId: `chat:${conversationId}`,
-                threadId: `chat:${conversationId}`,
-                categoryId: 'chat_message',
-                image: senderAvatarUrl,
-              }
-            );
-          }
-        } catch {}
-      }
-    }
+    await broadcastChatMessage({
+      convo,
+      message,
+      actor: req.user,
+      conversationId,
+      previewText: text,
+    });
 
     res.status(201).json({ message });
   } catch (e) {

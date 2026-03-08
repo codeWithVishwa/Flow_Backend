@@ -1,12 +1,15 @@
 import { Server } from "socket.io";
 import User from "./models/user.model.js";
 import Conversation from "./models/conversation.model.js";
+import Message from "./models/message.model.js";
 import { sendPushNotification } from "./utils/expoPush.js";
 import { deliverPendingNotificationsOnReconnect } from "./utils/messageNotifications.js";
 
 let io;
 // Presence set (kept for existing features like presence:update)
 const onlineUsers = new Set();
+const pendingOfflineTimers = new Map();
+const PRESENCE_OFFLINE_GRACE_MS = 12000;
 
 // Active audio call tracking (in-memory)
 const activeCalls = new Map(); // callId -> { callerId, calleeId, createdAt }
@@ -15,6 +18,28 @@ const userActiveCall = new Map(); // userId -> callId
 // Requirement: maintain in-memory map userId -> socketId
 // Note: users may connect from multiple devices; we store a Set of socketIds.
 const userSocketIds = new Map();
+
+function clearPendingOffline(userId) {
+  const uid = String(userId || "");
+  if (!uid) return;
+  const timer = pendingOfflineTimers.get(uid);
+  if (!timer) return;
+  clearTimeout(timer);
+  pendingOfflineTimers.delete(uid);
+}
+
+export function emitMessageDeliveredReceipt({ conversationId, messageIds = [], recipientId, senderId }) {
+  if (!io || !conversationId || !recipientId || !senderId) return;
+  const normalizedMessageIds = (Array.isArray(messageIds) ? messageIds : [])
+    .map((id) => String(id || ""))
+    .filter(Boolean);
+  if (!normalizedMessageIds.length) return;
+  io.to(`user:${String(senderId)}`).emit("message:delivered", {
+    conversationId: String(conversationId),
+    recipientId: String(recipientId),
+    messageIds: normalizedMessageIds,
+  });
+}
 
 export function initSocket(server) {
   const configuredOrigins = [
@@ -91,12 +116,82 @@ export function initSocket(server) {
       });
   };
 
+  const flushDeliveredMessagesForUser = async (userId) => {
+    const uid = String(userId || "");
+    if (!uid) return;
+    const conversations = await Conversation.find({ participants: uid }).select("_id");
+    if (!conversations.length) return;
+    const conversationIds = conversations.map((entry) => entry._id);
+    const pendingMessages = await Message.find({
+      conversation: { $in: conversationIds },
+      sender: { $ne: uid },
+      deliveredTo: { $ne: uid },
+    })
+      .select("_id conversation sender")
+      .sort({ createdAt: 1 })
+      .limit(500)
+      .lean();
+    if (!pendingMessages.length) return;
+
+    const pendingIds = pendingMessages.map((entry) => entry._id);
+    await Message.updateMany(
+      { _id: { $in: pendingIds } },
+      { $addToSet: { deliveredTo: uid } }
+    );
+
+    const grouped = new Map();
+    pendingMessages.forEach((entry) => {
+      const key = `${String(entry.conversation)}:${String(entry.sender)}`;
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          conversationId: String(entry.conversation),
+          senderId: String(entry.sender),
+          messageIds: [],
+        });
+      }
+      grouped.get(key).messageIds.push(String(entry._id));
+    });
+
+    grouped.forEach((entry) => {
+      emitMessageDeliveredReceipt({
+        conversationId: entry.conversationId,
+        messageIds: entry.messageIds,
+        recipientId: uid,
+        senderId: entry.senderId,
+      });
+    });
+  };
+
+  const scheduleOfflinePresence = (userId) => {
+    const uid = String(userId || "");
+    if (!uid) return;
+    clearPendingOffline(uid);
+    pendingOfflineTimers.set(
+      uid,
+      setTimeout(async () => {
+        pendingOfflineTimers.delete(uid);
+        if (getSocketIdsForUser(uid).length > 0) return;
+        if (!onlineUsers.has(uid)) return;
+        onlineUsers.delete(uid);
+        const ts = new Date();
+        await User.findByIdAndUpdate(uid, { lastActiveAt: ts }).catch(() => {});
+        io.emit("presence:update", {
+          userId: uid,
+          online: false,
+          lastActiveAt: ts.toISOString(),
+        });
+      }, PRESENCE_OFFLINE_GRACE_MS)
+    );
+  };
+
   io.on("connection", async (socket) => {
     const userId = socket.handshake.auth?.userId || socket.handshake.query?.userId;
     const socketUserId = userId ? String(userId) : null;
     if (userId) {
       // 1) Track socket mapping for real-time notifications
       const uid = String(userId);
+      const wasOnline = onlineUsers.has(uid);
+      clearPendingOffline(uid);
       if (!userSocketIds.has(uid)) userSocketIds.set(uid, new Set());
       userSocketIds.get(uid).add(socket.id);
 
@@ -107,7 +202,15 @@ export function initSocket(server) {
       
       const connectedAt = new Date();
       User.findByIdAndUpdate(userId, { lastActiveAt: connectedAt }).catch(()=>{});
-      io.emit("presence:update", { userId: String(userId), online: true, lastActiveAt: connectedAt.toISOString() });
+      if (!wasOnline) {
+        io.emit("presence:update", { userId: String(userId), online: true, lastActiveAt: connectedAt.toISOString() });
+      }
+
+      try {
+        await flushDeliveredMessagesForUser(uid);
+      } catch (e) {
+        console.error("Error flushing delivered messages", e);
+      }
 
       // 2) Deliver any queued (offline) message notifications on reconnect
       try {
@@ -297,9 +400,7 @@ export function initSocket(server) {
           if (set.size === 0) userSocketIds.delete(uid);
         }
 
-        // Check if still any sockets in room
-        const room = io.sockets.adapter.rooms.get(`user:${userId}`);
-        if (!room || room.size === 0) {
+        if (getSocketIdsForUser(uid).length === 0) {
           const callId = userActiveCall.get(uid);
           if (callId) {
             const entry = clearCall(callId);
@@ -315,11 +416,7 @@ export function initSocket(server) {
               }
             }
           }
-
-          onlineUsers.delete(uid);
-          const ts = new Date();
-          User.findByIdAndUpdate(userId, { lastActiveAt: ts }).catch(()=>{});
-          io.emit("presence:update", { userId: String(userId), online: false, lastActiveAt: ts.toISOString() });
+          scheduleOfflinePresence(uid);
         }
       }
     });

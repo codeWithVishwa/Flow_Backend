@@ -16,7 +16,9 @@ const messageSchema = new mongoose.Schema(
     post: { type: mongoose.Schema.Types.ObjectId, ref: "Post", default: null },
     sharedProfile: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     replyTo: { type: mongoose.Schema.Types.ObjectId, ref: "Message", default: null },
+    clientMessageId: { type: String, default: null, trim: true },
     readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+    deliveredTo: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
     deleted: { type: Boolean, default: false },
     deletedAt: { type: Date, default: null },
     deletedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
@@ -29,5 +31,14 @@ const messageSchema = new mongoose.Schema(
 );
 
 messageSchema.index({ conversation: 1, createdAt: -1 });
+messageSchema.index(
+  { conversation: 1, sender: 1, clientMessageId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      clientMessageId: { $exists: true, $type: "string", $ne: "" },
+    },
+  }
+);
 
 export default mongoose.model("Message", messageSchema);
