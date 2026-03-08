@@ -76,6 +76,21 @@ export function initSocket(server) {
     return null;
   };
 
+  const emitTypingEvent = async ({ conversationId, userId, eventName }) => {
+    if (!conversationId || !userId || !eventName) return;
+    const convo = await Conversation.findById(conversationId).select("participants");
+    if (!convo?.participants?.length) return;
+    const senderId = String(userId);
+    const isParticipant = convo.participants.some((id) => String(id) === senderId);
+    if (!isParticipant) return;
+    convo.participants
+      .map((id) => String(id))
+      .filter((id) => id !== senderId)
+      .forEach((id) => {
+        io.to(`user:${id}`).emit(eventName, { conversationId, userId: senderId });
+      });
+  };
+
   io.on("connection", async (socket) => {
     const userId = socket.handshake.auth?.userId || socket.handshake.query?.userId;
     const socketUserId = userId ? String(userId) : null;
@@ -87,10 +102,12 @@ export function initSocket(server) {
 
       socket.join(`user:${userId}`);
       onlineUsers.add(uid);
+
+      socket.emit("presence:snapshot", { userIds: Array.from(onlineUsers) });
       
-      // Update lastActiveAt
-      User.findByIdAndUpdate(userId, { lastActiveAt: new Date() }).catch(()=>{});
-      io.emit("presence:update", { userId: String(userId), online: true, lastActiveAt: new Date().toISOString() });
+      const connectedAt = new Date();
+      User.findByIdAndUpdate(userId, { lastActiveAt: connectedAt }).catch(()=>{});
+      io.emit("presence:update", { userId: String(userId), online: true, lastActiveAt: connectedAt.toISOString() });
 
       // 2) Deliver any queued (offline) message notifications on reconnect
       try {
@@ -132,17 +149,23 @@ export function initSocket(server) {
         const lastStartAt = socket.data?.typingStartAt || 0;
         if (now - lastStartAt < 700) return;
         socket.data.typingStartAt = now;
-
-        const convo = await Conversation.findById(conversationId).select("participants");
-        if (!convo?.participants?.length) return;
-        const isParticipant = convo.participants.some((id) => String(id) === socketUserId);
-        if (!isParticipant) return;
-        convo.participants
-          .map((id) => String(id))
-          .filter((id) => id !== socketUserId)
-          .forEach((id) => {
-            io.to(`user:${id}`).emit("typing:start", { conversationId, userId: socketUserId });
+        const previousConversationId = socket.data?.typingConversationId;
+        if (
+          previousConversationId &&
+          String(previousConversationId) !== String(conversationId)
+        ) {
+          await emitTypingEvent({
+            conversationId: previousConversationId,
+            userId: socketUserId,
+            eventName: "typing:stop",
           });
+        }
+        socket.data.typingConversationId = String(conversationId);
+        await emitTypingEvent({
+          conversationId,
+          userId: socketUserId,
+          eventName: "typing:start",
+        });
       } catch {}
     });
 
@@ -155,17 +178,14 @@ export function initSocket(server) {
         const lastStopAt = socket.data?.typingStopAt || 0;
         if (now - lastStopAt < 300) return;
         socket.data.typingStopAt = now;
-
-        const convo = await Conversation.findById(conversationId).select("participants");
-        if (!convo?.participants?.length) return;
-        const isParticipant = convo.participants.some((id) => String(id) === socketUserId);
-        if (!isParticipant) return;
-        convo.participants
-          .map((id) => String(id))
-          .filter((id) => id !== socketUserId)
-          .forEach((id) => {
-            io.to(`user:${id}`).emit("typing:stop", { conversationId, userId: socketUserId });
-          });
+        if (String(socket.data?.typingConversationId || "") === String(conversationId)) {
+          socket.data.typingConversationId = null;
+        }
+        await emitTypingEvent({
+          conversationId,
+          userId: socketUserId,
+          eventName: "typing:stop",
+        });
       } catch {}
     });
 
@@ -259,6 +279,16 @@ export function initSocket(server) {
 
     socket.on("disconnect", () => {
       if (userId) {
+        const typingConversationId = socket.data?.typingConversationId;
+        if (typingConversationId && socketUserId) {
+          emitTypingEvent({
+            conversationId: typingConversationId,
+            userId: socketUserId,
+            eventName: "typing:stop",
+          }).catch(() => {});
+          socket.data.typingConversationId = null;
+        }
+
         // 3) Remove socketId from map; user is offline only when all sockets are gone
         const uid = String(userId);
         const set = userSocketIds.get(uid);

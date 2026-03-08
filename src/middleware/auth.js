@@ -17,13 +17,14 @@ export default async function auth(req, res, next) {
     const user = await User.findById(payload.id).select("_id name nickname email verified avatarUrl");
     if (!user) return res.status(401).json({ message: "Invalid token" });
 
-    // Best-effort presence + IP update (do not block request)
+    // Best-effort IP update (do not block request).
+    // Presence/last-active are managed by the socket lifecycle.
     const ipHeader = (req.headers['x-forwarded-for'] || '').toString();
     const forwardedIp = ipHeader.split(',')[0]?.trim();
     const ip = forwardedIp || req.headers['x-real-ip'] || req.ip || null;
-    const update = { lastActiveAt: new Date() };
-    if (ip) update.lastIp = ip;
-    User.findByIdAndUpdate(user._id, update).catch(() => {});
+    if (ip) {
+      User.findByIdAndUpdate(user._id, { lastIp: ip }).catch(() => {});
+    }
 
     req.user = user;
     next();

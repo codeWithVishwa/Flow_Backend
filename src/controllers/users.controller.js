@@ -745,7 +745,9 @@ export const getUserBasic = async (req, res) => {
     const { userId } = req.params;
     const user = await User.findById(userId).select('_id name nickname avatarUrl lastActiveAt isVerified verificationType');
     if (!user) return res.status(404).json({ message: 'User not found' });
-    res.json({ user });
+    const normalizedUserId = String(userId);
+    const isOnline = getSocketIdsForUser(normalizedUserId).length > 0 || getOnlineUsers().has(normalizedUserId);
+    res.json({ user: { ...user.toObject(), isOnline } });
   } catch (e) { res.status(500).json({ message: e.message }); }
 };
 

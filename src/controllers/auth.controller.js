@@ -517,7 +517,6 @@ export const login = async (req, res) => {
     const ip = forwardedIp || req.ip || null;
     user.lastIp = ip;
     user.lastLoginAt = new Date();
-    user.lastActiveAt = new Date();
     user.save().catch(() => {});
 
     const token = signMobileToken(user._id);
