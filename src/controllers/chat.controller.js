@@ -871,8 +871,17 @@ export const sendMessage = async (req, res) => {
     const onlineUsers = getOnlineUsers();
     
     if (io) {
-      const recipients = convo.participants.filter((p) => String(p) !== String(req.user._id));
-      
+      const senderId = String(req.user._id);
+      const recipients = convo.participants.filter((p) => String(p) !== senderId);
+
+      // Emit message:new back to sender for instant chat screen update
+      const senderMessageToSend = message.toObject();
+      if (senderMessageToSend?.sender && typeof senderMessageToSend.sender === 'object') {
+        senderMessageToSend.senderName = senderMessageToSend.sender.nickname || senderMessageToSend.sender.name;
+        senderMessageToSend.senderAvatarUrl = senderMessageToSend.sender.avatarUrl;
+      }
+      io.to(`user:${senderId}`).emit("message:new", { conversationId, message: senderMessageToSend });
+
       for (const rid of recipients) {
         const recipientId = String(rid);
         
@@ -1184,13 +1193,15 @@ export const replyFromNotification = async (req, res) => {
     
     if (io) {
       const rid = String(receiverId);
+      const senderId = String(req.user._id);
       const messageToSend = message.toObject();
       if (messageToSend?.sender && typeof messageToSend.sender === 'object') {
         messageToSend.senderName = messageToSend.sender.nickname || messageToSend.sender.name;
         messageToSend.senderAvatarUrl = messageToSend.sender.avatarUrl;
       }
-      // Always emit message:new for chat UIs
+      // Always emit message:new for chat UIs (recipient and sender)
       io.to(`user:${rid}`).emit("message:new", { conversationId, message: messageToSend });
+      io.to(`user:${senderId}`).emit("message:new", { conversationId, message: messageToSend });
 
       // Instagram-like in-app notification banner
       const socketIds = getSocketIdsForUser(rid);
