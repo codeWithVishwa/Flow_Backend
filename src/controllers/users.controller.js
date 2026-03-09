@@ -207,7 +207,7 @@ async function filterNotificationsForViewer(userId, notifications) {
   const cache = new Map();
   const filtered = [];
   for (const notification of notifications) {
-    if (notification.type === "comment_mention") {
+    if (notification.type === "comment_mention" || notification.type === "post_mention") {
       const postId = notification.metadata?.postId;
       if (!postId) {
         await Notification.deleteOne({ _id: notification._id }).catch(() => {});

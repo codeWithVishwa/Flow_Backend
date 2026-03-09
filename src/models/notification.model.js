@@ -6,7 +6,7 @@ const notificationSchema = new mongoose.Schema(
     actor: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: false, default: null },
     type: {
       type: String,
-      enum: ["comment_mention", "follow_request", "follow", "admin"],
+      enum: ["comment_mention", "post_mention", "follow_request", "follow", "admin"],
       required: true,
     },
     metadata: { type: mongoose.Schema.Types.Mixed, default: {} },

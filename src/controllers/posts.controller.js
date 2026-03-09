@@ -75,6 +75,148 @@ function extractHashtags(caption) {
   return tags.map((t) => normalizeTag(t.replace("#", ""))).filter(Boolean);
 }
 
+function normalizeMentionHandle(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^@+/, "")
+    .replace(/[^a-z0-9_.-\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function mentionHandleCandidates(value) {
+  const normalized = normalizeMentionHandle(value);
+  if (!normalized) return [];
+  const variants = new Set([normalized]);
+  const alt = normalized.replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim();
+  if (alt) variants.add(alt);
+  return Array.from(variants).filter(Boolean);
+}
+
+function extractMentionHandles(text) {
+  if (!text) return [];
+  const matches = text.match(/@([A-Za-z0-9_.-]+)/g) || [];
+  const handles = matches
+    .map((token) => normalizeMentionHandle(token.slice(1)))
+    .filter(Boolean);
+  return Array.from(new Set(handles));
+}
+
+async function resolveMentionedUsersFromText(text) {
+  const handles = extractMentionHandles(text);
+  if (!handles.length) return [];
+
+  const variantsByHandle = new Map();
+  const queryValues = new Set();
+  handles.forEach((handle) => {
+    const variants = mentionHandleCandidates(handle);
+    variantsByHandle.set(handle, variants);
+    variants.forEach((variant) => queryValues.add(variant));
+  });
+
+  const users = await User.find({ nameLower: { $in: Array.from(queryValues) } })
+    .select("_id name nameLower nickname avatarUrl pushToken")
+    .lean();
+
+  const userByNameLower = new Map(
+    users
+      .filter((user) => user?.nameLower)
+      .map((user) => [String(user.nameLower).toLowerCase(), user])
+  );
+
+  const resolved = [];
+  const seenIds = new Set();
+  handles.forEach((handle) => {
+    const match = (variantsByHandle.get(handle) || [])
+      .map((variant) => userByNameLower.get(String(variant).toLowerCase()))
+      .find(Boolean);
+    if (!match) return;
+    const userId = String(match._id);
+    if (seenIds.has(userId)) return;
+    seenIds.add(userId);
+    resolved.push(match);
+  });
+
+  return resolved;
+}
+
+function buildPostMentionPreview(post) {
+  const previewMedia = Array.isArray(post?.media) && post.media.length ? post.media[0] : null;
+  return {
+    _id: post?._id,
+    authorId: post?.author?._id || post?.author || null,
+    authorName: post?.author?.name || null,
+    authorAvatar: post?.author?.avatarUrl || null,
+    caption: post?.caption || "",
+    media: previewMedia,
+    mediaList: Array.isArray(post?.media) ? post.media : [],
+    createdAt: post?.createdAt || null,
+  };
+}
+
+async function createPostMentionNotifications(req, post, mentionedUsers = []) {
+  if (!post?._id || !Array.isArray(mentionedUsers) || !mentionedUsers.length) return;
+
+  const preview = buildPostMentionPreview(post);
+  const snippet = String(post?.caption || "").trim().slice(0, 140);
+  const actorName = req.user?.nickname || req.user?.name || post?.author?.nickname || post?.author?.name || "Someone";
+  const senderAvatarUrl =
+    (req.user?.avatarUrl && (String(req.user.avatarUrl).startsWith("http") ? req.user.avatarUrl : null)) || null;
+
+  await Promise.all(
+    mentionedUsers.map((mentionedUser) =>
+      Notification.findOneAndUpdate(
+        { user: mentionedUser._id, type: "post_mention", "metadata.postId": post._id },
+        {
+          user: mentionedUser._id,
+          actor: req.user._id,
+          type: "post_mention",
+          metadata: {
+            postId: post._id,
+            postOwnerId: post?.author?._id || post?.author || null,
+            mentionedUserId: mentionedUser._id,
+            snippet,
+            postPreview: preview,
+          },
+        },
+        { upsert: true, setDefaultsOnInsert: true }
+      ).catch(() => {})
+    )
+  );
+
+  try {
+    const onlineUsers = getOnlineUsers();
+    await Promise.all(
+      mentionedUsers.map(async (mentionedUser) => {
+        const recipientId = String(mentionedUser?._id || "");
+        if (!recipientId) return;
+        const socketIds = getSocketIdsForUser(recipientId);
+        const isOnline = socketIds.length > 0 || onlineUsers.has(recipientId);
+        if (isOnline || !mentionedUser?.pushToken) return;
+
+        await sendPushNotification(
+          mentionedUser.pushToken,
+          "Mention",
+          `${actorName} mentioned you in a post`,
+          {
+            type: "post_mention",
+            postId: String(post._id),
+            senderId: String(req.user._id),
+            senderUsername: actorName,
+            senderAvatarUrl,
+          },
+          {
+            collapseId: `post-mention:${String(post._id)}:${recipientId}`,
+            threadId: `post-mention:${recipientId}`,
+            image: senderAvatarUrl,
+          }
+        );
+      })
+    );
+  } catch {}
+}
+
 function parseBoolean(value) {
   if (typeof value === "boolean") return value;
   if (typeof value === "string") {
@@ -522,7 +664,7 @@ export const generateVideoUploadSignature = async (req, res) => {
 
 export const createPost = async (req, res) => {
   try {
-    const author = await User.findById(req.user._id).select("_id isPrivate name avatarUrl");
+    const author = await User.findById(req.user._id).select("_id isPrivate name nickname avatarUrl");
     if (!author) return res.status(404).json({ message: "User not found" });
 
     const caption = typeof req.body.caption === "string" ? req.body.caption.trim().slice(0, 500) : "";
@@ -582,16 +724,34 @@ export const createPost = async (req, res) => {
       }
     }
 
+    const resolvedMentionedUsers = await resolveMentionedUsersFromText(caption);
+    const eligibleMentionedUsers = (
+      await Promise.all(
+        resolvedMentionedUsers.map(async (mentionedUser) => {
+          const mentionedId = String(mentionedUser?._id || "");
+          if (!mentionedId || mentionedId === String(req.user._id)) return null;
+          const allowed = await canViewPost(mentionedUser._id, {
+            author: author._id,
+            visibility: author.isPrivate ? "private" : "public",
+          });
+          return allowed ? mentionedUser : null;
+        })
+      )
+    ).filter(Boolean);
+    const mentionIds = eligibleMentionedUsers.map((mentionedUser) => mentionedUser._id);
+
       const post = await Post.create({
         author: author._id,
         caption,
         tags,
         isAdult,
         media,
+        mentions: mentionIds,
         visibility: author.isPrivate ? "private" : "public",
       });
 
-    const populated = await post.populate("author", "_id name avatarUrl isPrivate isVerified verificationType");
+    const populated = await post.populate("author", "_id name nickname avatarUrl isPrivate isVerified verificationType");
+    await createPostMentionNotifications(req, populated, eligibleMentionedUsers);
     res.status(201).json({ post: serializePost(populated, req.user._id, new Set()) });
   } catch (e) {
     res.status(500).json({ message: e.message });
@@ -1225,17 +1385,16 @@ export const addComment = async (req, res) => {
       { path: "parent", select: "_id author", populate: { path: "author", select: "_id name avatarUrl isVerified verificationType" } },
     ]);
 
-    const mentionMatches = Array.from(new Set((text.match(/@([\w]+)/g) || []).map((token) => token.slice(1).toLowerCase())));
-    if (mentionMatches.length) {
-      const mentionedUsers = await User.find({ nameLower: { $in: mentionMatches } }).select("_id");
-      const eligibleMentionedIds = (await Promise.all(
+    const mentionedUsers = await resolveMentionedUsersFromText(text);
+    if (mentionedUsers.length) {
+      const eligibleMentionedUsers = (await Promise.all(
         mentionedUsers.map(async (mentioned) => {
           if (String(mentioned._id) === String(req.user._id)) return null;
           const allowed = await canViewPost(mentioned._id, post);
-          return allowed ? mentioned._id : null;
+          return allowed ? mentioned : null;
         })
       )).filter(Boolean);
-      if (eligibleMentionedIds.length) {
+      if (eligibleMentionedUsers.length) {
         const previewMedia = Array.isArray(post.media) && post.media.length ? post.media[0] : null;
         const baseMetadata = {
           commentId: comment._id,
@@ -1252,14 +1411,14 @@ export const addComment = async (req, res) => {
           },
         };
         await Promise.all(
-          eligibleMentionedIds.map((mentionedId) =>
+          eligibleMentionedUsers.map((mentionedUser) =>
             Notification.findOneAndUpdate(
-              { user: mentionedId, type: 'comment_mention', 'metadata.commentId': comment._id },
+              { user: mentionedUser._id, type: 'comment_mention', 'metadata.commentId': comment._id },
               {
-                user: mentionedId,
+                user: mentionedUser._id,
                 actor: req.user._id,
                 type: 'comment_mention',
-                metadata: { ...baseMetadata, mentionedUserId: mentionedId },
+                metadata: { ...baseMetadata, mentionedUserId: mentionedUser._id },
               },
               { upsert: true, setDefaultsOnInsert: true }
             ).catch(() => {})
@@ -1272,15 +1431,15 @@ export const addComment = async (req, res) => {
           const senderAvatarUrl = (req.user?.avatarUrl && (String(req.user.avatarUrl).startsWith('http') ? req.user.avatarUrl : null)) || null;
 
           await Promise.all(
-            eligibleMentionedIds.map(async (mentionedId) => {
-              const recipientId = String(mentionedId);
+            eligibleMentionedUsers.map(async (mentionedUser) => {
+              const recipientId = String(mentionedUser?._id || "");
+              if (!recipientId) return;
               const socketIds = getSocketIdsForUser(recipientId);
               const isOnline = socketIds.length > 0 || onlineUsers.has(recipientId);
               if (isOnline) return;
-              const recipient = await User.findById(recipientId).select('pushToken');
-              if (!recipient?.pushToken) return;
+              if (!mentionedUser?.pushToken) return;
               await sendPushNotification(
-                recipient.pushToken,
+                mentionedUser.pushToken,
                 'Mention',
                 `${req.user.name || 'Someone'} mentioned you`,
                 {
@@ -1305,6 +1464,36 @@ export const addComment = async (req, res) => {
 
     const populated = comment;
     res.status(201).json({ comment: serializeComment(populated) });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+};
+
+export const listMentionedPosts = async (req, res) => {
+  try {
+    const posts = await Post.find({
+      mentions: req.user._id,
+      isDelete: { $ne: true },
+      isDeleted: { $ne: true },
+    })
+      .sort({ createdAt: -1 })
+      .populate("author", "_id name nickname avatarUrl isPrivate isVerified verificationType");
+
+    for (const post of posts) {
+      // eslint-disable-next-line no-await-in-loop
+      await ensureVideoThumbnail(post);
+    }
+
+    const savedSet = await getSavedSetForUser(req.user._id);
+    const visiblePosts = [];
+
+    for (const post of posts) {
+      // eslint-disable-next-line no-await-in-loop
+      if (!(await canViewPost(req.user._id, post))) continue;
+      visiblePosts.push(serializePost(post, req.user._id, savedSet));
+    }
+
+    res.json({ posts: visiblePosts });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }

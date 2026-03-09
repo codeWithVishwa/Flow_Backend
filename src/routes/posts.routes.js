@@ -10,6 +10,7 @@ import {
   likePost,
   listPostComments,
   listFeedPosts,
+  listMentionedPosts,
   listUserPosts,
   listTrendingPosts,
   searchClips,
@@ -31,6 +32,7 @@ router.post("/video/signature", auth, uploadSignatureLimiter, generateVideoUploa
 router.post("/media", auth, uploadMedia.single("media"), uploadPostMedia);
 router.post("/", auth, createPostLimiter, createPost);
 router.get("/feed", auth, listFeedPosts);
+router.get("/mentioned/me", auth, listMentionedPosts);
 router.get("/trending", auth, listTrendingPosts);
 router.get("/search-clips", auth, searchClips);
 router.get("/:postId/related", auth, listRelatedClips);
