@@ -10,6 +10,8 @@ let io;
 const onlineUsers = new Set();
 const pendingOfflineTimers = new Map();
 const PRESENCE_OFFLINE_GRACE_MS = 12000;
+const pendingCallDisconnectTimers = new Map();
+const CALL_DISCONNECT_GRACE_MS = 10000;
 
 // Active audio call tracking (in-memory)
 const activeCalls = new Map(); // callId -> { callerId, calleeId, createdAt }
@@ -26,6 +28,15 @@ function clearPendingOffline(userId) {
   if (!timer) return;
   clearTimeout(timer);
   pendingOfflineTimers.delete(uid);
+}
+
+function clearPendingCallDisconnect(userId) {
+  const uid = String(userId || "");
+  if (!uid) return;
+  const timer = pendingCallDisconnectTimers.get(uid);
+  if (!timer) return;
+  clearTimeout(timer);
+  pendingCallDisconnectTimers.delete(uid);
 }
 
 export function emitMessageDeliveredReceipt({ conversationId, messageIds = [], recipientId, senderId }) {
@@ -79,6 +90,8 @@ export function initSocket(server) {
 
   const registerCall = (callId, callerId, calleeId) => {
     const entry = { callId, callerId: String(callerId), calleeId: String(calleeId), createdAt: Date.now() };
+    clearPendingCallDisconnect(entry.callerId);
+    clearPendingCallDisconnect(entry.calleeId);
     activeCalls.set(String(callId), entry);
     userActiveCall.set(String(callerId), String(callId));
     userActiveCall.set(String(calleeId), String(callId));
@@ -88,6 +101,8 @@ export function initSocket(server) {
   const clearCall = (callId) => {
     const entry = activeCalls.get(String(callId));
     if (!entry) return null;
+    clearPendingCallDisconnect(entry.callerId);
+    clearPendingCallDisconnect(entry.calleeId);
     userActiveCall.delete(String(entry.callerId));
     userActiveCall.delete(String(entry.calleeId));
     activeCalls.delete(String(callId));
@@ -99,6 +114,31 @@ export function initSocket(server) {
     if (String(entry.callerId) === uid) return entry.calleeId;
     if (String(entry.calleeId) === uid) return entry.callerId;
     return null;
+  };
+
+  const scheduleCallDisconnect = (userId) => {
+    const uid = String(userId || "");
+    if (!uid) return;
+    clearPendingCallDisconnect(uid);
+    pendingCallDisconnectTimers.set(
+      uid,
+      setTimeout(() => {
+        pendingCallDisconnectTimers.delete(uid);
+        if (getSocketIdsForUser(uid).length > 0) return;
+        const callId = userActiveCall.get(uid);
+        if (!callId) return;
+        const entry = clearCall(callId);
+        if (!entry) return;
+        const otherId = getOtherParty(entry, uid);
+        if (!otherId) return;
+        io.to(`user:${String(otherId)}`).emit("call:ended", {
+          callId,
+          fromUserId: uid,
+          toUserId: String(otherId),
+          reason: "disconnect",
+        });
+      }, CALL_DISCONNECT_GRACE_MS)
+    );
   };
 
   const emitTypingEvent = async ({ conversationId, userId, eventName }) => {
@@ -192,6 +232,7 @@ export function initSocket(server) {
       const uid = String(userId);
       const wasOnline = onlineUsers.has(uid);
       clearPendingOffline(uid);
+      clearPendingCallDisconnect(uid);
       if (!userSocketIds.has(uid)) userSocketIds.set(uid, new Set());
       userSocketIds.get(uid).add(socket.id);
 
@@ -414,21 +455,7 @@ export function initSocket(server) {
         }
 
         if (getSocketIdsForUser(uid).length === 0) {
-          const callId = userActiveCall.get(uid);
-          if (callId) {
-            const entry = clearCall(callId);
-            if (entry) {
-              const otherId = getOtherParty(entry, uid);
-              if (otherId) {
-                io.to(`user:${String(otherId)}`).emit("call:ended", {
-                  callId,
-                  fromUserId: uid,
-                  toUserId: String(otherId),
-                  reason: "disconnect",
-                });
-              }
-            }
-          }
+          scheduleCallDisconnect(uid);
           scheduleOfflinePresence(uid);
         }
       }
