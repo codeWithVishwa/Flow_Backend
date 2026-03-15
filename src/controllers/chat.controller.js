@@ -9,6 +9,7 @@ import { emitMessageDeliveredReceipt, getIO, getOnlineUsers, getSocketIdsForUser
 import { sendPushNotification } from "../utils/expoPush.js";
 import { buildMessageNotifyPayload, enqueuePendingMessageNotification } from "../utils/messageNotifications.js";
 import { decideChatPush } from "../utils/chatPushThrottle.js";
+import { listPushTokensFromUser } from "../utils/pushTargets.js";
 import cloudinary from "cloudinary";
 
 const MESSAGE_LIMIT_DEFAULT = 30;
@@ -297,8 +298,9 @@ async function broadcastChatMessage({ convo, message, actor, conversationId, pre
     });
 
     try {
-      const recipient = await User.findById(recipientId).select("pushToken");
-      if (!recipient?.pushToken) continue;
+      const recipient = await User.findById(recipientId).select("pushToken pushTokens");
+      const recipientTokens = listPushTokensFromUser(recipient);
+      if (!recipientTokens.length) continue;
       const pushDecision = await decideChatPush({
         userId: recipientId,
         fromUserId: actor._id,
@@ -311,23 +313,32 @@ async function broadcastChatMessage({ convo, message, actor, conversationId, pre
         ? `${pushDecision.suppressedSinceLastSend + 1} new messages: ${notifyPayload.lastMessage}`
         : notifyPayload.lastMessage;
 
-      await sendPushNotification(
-        recipient.pushToken,
-        senderUsername || "New message",
-        pushBody,
-        {
-          conversationId,
-          senderId: String(actor._id),
-          type: "chat_message",
-          senderUsername,
-          senderAvatarUrl,
-        },
-        {
-          collapseId: `chat:${conversationId}`,
-          threadId: `chat:${conversationId}`,
-          categoryId: "chat_message",
-          image: senderAvatarUrl,
-        }
+      await Promise.all(
+        recipientTokens.map((token) =>
+          sendPushNotification(
+            token,
+            senderUsername || "New message",
+            pushBody,
+            {
+              conversationId,
+              senderId: String(actor._id),
+              type: "chat_message",
+              senderUsername,
+              senderAvatarUrl,
+            },
+            {
+              collapseId: `chat:${conversationId}`,
+              threadId: `chat:${conversationId}`,
+              categoryId: "chat_message",
+              image: senderAvatarUrl,
+              analytics: {
+                recipientUserId: recipientId,
+                notificationType: "chat_message",
+                source: "push",
+              },
+            }
+          )
+        )
       );
     } catch {}
   }

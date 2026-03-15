@@ -2,6 +2,7 @@ import User from "../models/user.model.js";
 import Notification from "../models/notification.model.js";
 import { sendPushNotification } from "../utils/expoPush.js";
 import { getIO, getOnlineUsers, getSocketIdsForUser } from "../socket.js";
+import { listPushTokensFromUser } from "../utils/pushTargets.js";
 
 function toAbsoluteUrl(url) {
   if (!url || typeof url !== "string") return null;
@@ -108,24 +109,36 @@ export const followUser = async (req, res) => {
         const isOnline = socketIds.length > 0 || onlineUsers.has(recipientId);
 
         if (!isOnline) {
-          const recipient = await User.findById(recipientId).select("pushToken");
-          if (recipient?.pushToken) {
+          const recipient = await User.findById(recipientId).select("pushToken pushTokens");
+          const recipientTokens = listPushTokensFromUser(recipient);
+          if (recipientTokens.length) {
             const senderAvatarUrl = toAbsoluteUrl(req.user.avatarUrl) || null;
-            await sendPushNotification(
-              recipient.pushToken,
-              "Follow request",
-              `${req.user.name || "Someone"} requested to follow you`,
-              {
-                type: "follow_request",
-                senderId: String(req.user._id),
-                senderUsername: req.user.nickname || req.user.name || "",
-                senderAvatarUrl,
-              },
-              {
-                collapseId: `followreq:${recipientId}:${String(req.user._id)}`,
-                threadId: `followreq:${recipientId}`,
-                image: senderAvatarUrl,
-              }
+            await Promise.all(
+              recipientTokens.map((token) =>
+                sendPushNotification(
+                  token,
+                  "Follow request",
+                  `${req.user.name || "Someone"} requested to follow you`,
+                  {
+                    type: "follow_request",
+                    senderId: String(req.user._id),
+                    targetUserId: recipientId,
+                    senderUsername: req.user.nickname || req.user.name || "",
+                    senderAvatarUrl,
+                  },
+                  {
+                    collapseId: `followreq:${recipientId}:${String(req.user._id)}`,
+                    threadId: `followreq:${recipientId}`,
+                    categoryId: "follow_request",
+                    image: senderAvatarUrl,
+                    analytics: {
+                      recipientUserId: recipientId,
+                      notificationType: "follow_request",
+                      source: "push",
+                    },
+                  }
+                )
+              )
             );
           }
         }
@@ -177,24 +190,34 @@ export const followUser = async (req, res) => {
       const isOnline = socketIds.length > 0 || onlineUsers.has(recipientId);
 
       if (!isOnline) {
-        const recipient = await User.findById(recipientId).select("pushToken");
-        if (recipient?.pushToken) {
+        const recipient = await User.findById(recipientId).select("pushToken pushTokens");
+        const recipientTokens = listPushTokensFromUser(recipient);
+        if (recipientTokens.length) {
           const senderAvatarUrl = toAbsoluteUrl(req.user.avatarUrl) || null;
-          await sendPushNotification(
-            recipient.pushToken,
-            "New follower",
-            `${req.user.name || "Someone"} started following you`,
-            {
-              type: "follow",
-              senderId: String(req.user._id),
-              senderUsername: req.user.nickname || req.user.name || "",
-              senderAvatarUrl,
-            },
-            {
-              collapseId: `follow:${recipientId}:${String(req.user._id)}`,
-              threadId: `follow:${recipientId}`,
-              image: senderAvatarUrl,
-            }
+          await Promise.all(
+            recipientTokens.map((token) =>
+              sendPushNotification(
+                token,
+                "New follower",
+                `${req.user.name || "Someone"} started following you`,
+                {
+                  type: "follow",
+                  senderId: String(req.user._id),
+                  senderUsername: req.user.nickname || req.user.name || "",
+                  senderAvatarUrl,
+                },
+                {
+                  collapseId: `follow:${recipientId}:${String(req.user._id)}`,
+                  threadId: `follow:${recipientId}`,
+                  image: senderAvatarUrl,
+                  analytics: {
+                    recipientUserId: recipientId,
+                    notificationType: "follow",
+                    source: "push",
+                  },
+                }
+              )
+            )
           );
         }
       }

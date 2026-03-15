@@ -3,6 +3,8 @@ import path from "path";
 import { fileURLToPath } from "url";
 import admin from "firebase-admin";
 import { Expo } from "expo-server-sdk";
+import User from "../models/user.model.js";
+import NotificationEvent from "../models/notificationEvent.model.js";
 
 const expo = new Expo();
 const __filename = fileURLToPath(import.meta.url);
@@ -96,6 +98,59 @@ function normalizeData(data = {}) {
   }, {});
 }
 
+function getTokenSuffix(pushToken) {
+  return typeof pushToken === "string" ? pushToken.slice(-12) : null;
+}
+
+function isInvalidTokenErrorCode(code = "") {
+  const normalized = String(code || "").toLowerCase();
+  return (
+    normalized.includes("device") && normalized.includes("not") && normalized.includes("registered")
+  ) || normalized.includes("registration-token-not-registered");
+}
+
+function getAnalyticsPayload(options = {}) {
+  const analytics = options?.analytics;
+  if (!analytics?.recipientUserId) return null;
+  return {
+    recipientUserId: String(analytics.recipientUserId),
+    notificationType: typeof analytics.notificationType === "string" ? analytics.notificationType : null,
+    source: typeof analytics.source === "string" ? analytics.source : "push",
+  };
+}
+
+async function recordNotificationEvent(analytics = null, eventType, payload = {}) {
+  if (!analytics?.recipientUserId || !eventType) return;
+  try {
+    await NotificationEvent.create({
+      user: analytics.recipientUserId,
+      eventType,
+      source: analytics.source || "push",
+      notificationType: analytics.notificationType || null,
+      provider: payload?.provider || null,
+      tokenSuffix: payload?.tokenSuffix || null,
+      status: payload?.status || null,
+      metadata: payload?.metadata && typeof payload.metadata === "object" ? payload.metadata : {},
+    });
+  } catch {}
+}
+
+async function cleanupInvalidPushToken(pushToken, recipientUserId = null) {
+  if (!pushToken || typeof pushToken !== "string") return;
+  const token = pushToken.trim();
+  if (!token) return;
+
+  const recipientFilter = recipientUserId ? { _id: recipientUserId } : {};
+  await User.updateMany(
+    { ...recipientFilter, "pushTokens.token": token },
+    { $pull: { pushTokens: { token } } }
+  ).catch(() => {});
+  await User.updateMany(
+    { ...recipientFilter, pushToken: token },
+    { $unset: { pushToken: 1, pushTokenUpdatedAt: 1 } }
+  ).catch(() => {});
+}
+
 async function sendExpoPushNotification(pushToken, title, body, data = {}, options = {}) {
   const ttlSeconds = 60 * 60 * 24;
   const collapseId = options?.collapseId;
@@ -120,11 +175,22 @@ async function sendExpoPushNotification(pushToken, title, body, data = {}, optio
   }];
 
   const chunks = expo.chunkPushNotifications(messages);
+  let hadError = false;
+  let invalidToken = false;
+  let errorMessage = null;
+  let errorCode = null;
+
   for (const chunk of chunks) {
     try {
       const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
       for (const ticket of ticketChunk) {
         if (ticket.status === "error") {
+          hadError = true;
+          errorMessage = ticket.message || errorMessage;
+          errorCode = ticket?.details?.error || errorCode;
+          if (isInvalidTokenErrorCode(ticket?.details?.error)) {
+            invalidToken = true;
+          }
           console.error("[push] Expo ticket error", {
             message: ticket.message,
             details: ticket.details,
@@ -132,15 +198,35 @@ async function sendExpoPushNotification(pushToken, title, body, data = {}, optio
         }
       }
     } catch (error) {
+      hadError = true;
+      errorMessage = error?.message || errorMessage;
+      errorCode = error?.code || errorCode;
+      if (isInvalidTokenErrorCode(error?.code)) {
+        invalidToken = true;
+      }
       console.error("[push] Error sending Expo push chunk", error);
     }
   }
+
+  return {
+    ok: !hadError,
+    provider: "expo",
+    invalidToken,
+    errorCode,
+    errorMessage,
+  };
 }
 
 async function sendFcmPushNotification(pushToken, title, body, data = {}, options = {}) {
   const messaging = getFirebaseMessaging();
   if (!messaging) {
-    return;
+    return {
+      ok: false,
+      provider: "fcm",
+      invalidToken: false,
+      errorCode: "messaging_unavailable",
+      errorMessage: "Firebase messaging is not configured",
+    };
   }
 
   const ttlMilliseconds = 60 * 60 * 24 * 1000;
@@ -190,27 +276,85 @@ async function sendFcmPushNotification(pushToken, title, body, data = {}, option
 
   try {
     await messaging.send(message);
+    return {
+      ok: true,
+      provider: "fcm",
+      invalidToken: false,
+      errorCode: null,
+      errorMessage: null,
+    };
   } catch (error) {
+    const invalidToken = isInvalidTokenErrorCode(error?.code);
     console.error("[push] Error sending FCM push notification", {
       code: error?.code,
       message: error?.message,
     });
+    return {
+      ok: false,
+      provider: "fcm",
+      invalidToken,
+      errorCode: error?.code || null,
+      errorMessage: error?.message || null,
+    };
   }
 }
 
 export const sendPushNotification = async (pushToken, title, body, data = {}, options = {}) => {
   if (!pushToken || typeof pushToken !== "string") {
-    return;
+    return { ok: false, provider: "unknown", invalidToken: false, errorCode: "invalid_token", errorMessage: "Missing token" };
   }
 
+  const analytics = getAnalyticsPayload(options);
+  const tokenSuffix = getTokenSuffix(pushToken);
+  const provider = Expo.isExpoPushToken(pushToken) ? "expo" : "fcm";
+  await recordNotificationEvent(analytics, "sent", {
+    provider,
+    tokenSuffix,
+    status: "queued",
+  });
+
   try {
+    let result;
     if (Expo.isExpoPushToken(pushToken)) {
-      await sendExpoPushNotification(pushToken, title, body, data, options);
-      return;
+      result = await sendExpoPushNotification(pushToken, title, body, data, options);
+    } else {
+      result = await sendFcmPushNotification(pushToken, title, body, data, options);
     }
 
-    await sendFcmPushNotification(pushToken, title, body, data, options);
+    if (result?.invalidToken) {
+      await cleanupInvalidPushToken(pushToken, analytics?.recipientUserId || null);
+    }
+
+    await recordNotificationEvent(analytics, result?.ok ? "provider_accepted" : "delivery_failed", {
+      provider: result?.provider || provider,
+      tokenSuffix,
+      status: result?.ok ? "ok" : (result?.errorCode || "error"),
+      metadata: result?.ok
+        ? {}
+        : {
+            errorCode: result?.errorCode || null,
+            errorMessage: result?.errorMessage || null,
+            invalidToken: !!result?.invalidToken,
+          },
+    });
+    return result;
   } catch (error) {
     console.error("[push] Error sending push notification", error);
+    await recordNotificationEvent(analytics, "delivery_failed", {
+      provider,
+      tokenSuffix,
+      status: error?.code || "exception",
+      metadata: {
+        errorCode: error?.code || null,
+        errorMessage: error?.message || null,
+      },
+    });
+    return {
+      ok: false,
+      provider,
+      invalidToken: isInvalidTokenErrorCode(error?.code),
+      errorCode: error?.code || null,
+      errorMessage: error?.message || null,
+    };
   }
 };

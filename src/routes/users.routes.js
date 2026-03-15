@@ -1,6 +1,6 @@
 import express from "express";
 import auth from "../middleware/auth.js";
-import { searchUsers, listContacts, getProfile, updateProfile, uploadAvatar, listOnlineUsers, removeFriend, recommendFriends, getUserBasic, getUserPublicProfile, toggleProfileLike, listProfileLikers, listBlockedUsers, blockUser, unblockUser, listNotifications, markAllNotificationsRead, getChateableUsers, getFollowersList, getFollowingList, updatePushToken, clearPushToken, getMyPushTokenStatus, deactivateAccount, deleteAccount, updateMyLocation, listNearbyUsers } from "../controllers/users.controller.js";
+import { searchUsers, listContacts, getProfile, updateProfile, uploadAvatar, listOnlineUsers, removeFriend, recommendFriends, getUserBasic, getUserPublicProfile, toggleProfileLike, listProfileLikers, listBlockedUsers, blockUser, unblockUser, listNotifications, markAllNotificationsRead, trackNotificationEvent, getChateableUsers, getFollowersList, getFollowingList, updatePushToken, clearPushToken, getMyPushTokenStatus, deactivateAccount, deleteAccount, updateMyLocation, listNearbyUsers } from "../controllers/users.controller.js";
 import { followUser, unfollowUser, getFollowRequests, acceptFollowRequest, rejectFollowRequest, removeFollower } from "../controllers/follow.controller.js";
 import { uploadEncryptionPublicKey, getEncryptionPublicKey } from "../controllers/encryption.controller.js";
 import { upload } from "../middleware/upload.js";
@@ -14,6 +14,7 @@ router.get("/search", auth, searchUsers);
 router.get("/chateable", auth, getChateableUsers);
 router.get("/notifications", auth, listNotifications);
 router.post("/notifications/read-all", auth, markAllNotificationsRead);
+router.post("/notifications/events", auth, trackNotificationEvent);
 router.patch("/location", auth, updateMyLocation);
 router.get("/nearby", auth, listNearbyUsers);
 router.get("/contacts", auth, listContacts);

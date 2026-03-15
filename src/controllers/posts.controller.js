@@ -8,7 +8,8 @@ import User from "../models/user.model.js";
 import Comment from "../models/comment.model.js";
 import Notification from "../models/notification.model.js";
 import { sendPushNotification } from "../utils/expoPush.js";
-import { getOnlineUsers, getSocketIdsForUser } from "../socket.js";
+import { getIO, getOnlineUsers, getSocketIdsForUser } from "../socket.js";
+import { listPushTokensFromUser } from "../utils/pushTargets.js";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 
@@ -116,7 +117,7 @@ async function resolveMentionedUsersFromText(text) {
   });
 
   const users = await User.find({ nameLower: { $in: Array.from(queryValues) } })
-    .select("_id name nameLower nickname avatarUrl pushToken")
+    .select("_id name nameLower nickname avatarUrl pushToken pushTokens")
     .lean();
 
   const userByNameLower = new Map(
@@ -186,6 +187,24 @@ async function createPostMentionNotifications(req, post, mentionedUsers = []) {
   );
 
   try {
+    const io = getIO();
+    const nowIso = new Date().toISOString();
+    mentionedUsers.forEach((mentionedUser) => {
+      const recipientId = String(mentionedUser?._id || "");
+      if (!recipientId) return;
+      io.to(`user:${recipientId}`).emit("notify:update", {
+        type: "post_mention",
+        actorId: String(req.user?._id || ""),
+        actorName: actorName || "Someone",
+        actorAvatarUrl: senderAvatarUrl,
+        message: `${actorName} mentioned you in a post`,
+        createdAt: nowIso,
+        postId: String(post._id),
+      });
+    });
+  } catch {}
+
+  try {
     const onlineUsers = getOnlineUsers();
     await Promise.all(
       mentionedUsers.map(async (mentionedUser) => {
@@ -193,24 +212,35 @@ async function createPostMentionNotifications(req, post, mentionedUsers = []) {
         if (!recipientId) return;
         const socketIds = getSocketIdsForUser(recipientId);
         const isOnline = socketIds.length > 0 || onlineUsers.has(recipientId);
-        if (isOnline || !mentionedUser?.pushToken) return;
+        if (isOnline) return;
+        const targetTokens = listPushTokensFromUser(mentionedUser);
+        if (!targetTokens.length) return;
 
-        await sendPushNotification(
-          mentionedUser.pushToken,
-          "Mention",
-          `${actorName} mentioned you in a post`,
-          {
-            type: "post_mention",
-            postId: String(post._id),
-            senderId: String(req.user._id),
-            senderUsername: actorName,
-            senderAvatarUrl,
-          },
-          {
-            collapseId: `post-mention:${String(post._id)}:${recipientId}`,
-            threadId: `post-mention:${recipientId}`,
-            image: senderAvatarUrl,
-          }
+        await Promise.all(
+          targetTokens.map((token) =>
+            sendPushNotification(
+              token,
+              "Mention",
+              `${actorName} mentioned you in a post`,
+              {
+                type: "post_mention",
+                postId: String(post._id),
+                senderId: String(req.user._id),
+                senderUsername: actorName,
+                senderAvatarUrl,
+              },
+              {
+                collapseId: `post-mention:${String(post._id)}:${recipientId}`,
+                threadId: `post-mention:${recipientId}`,
+                image: senderAvatarUrl,
+                analytics: {
+                  recipientUserId: recipientId,
+                  notificationType: "post_mention",
+                  source: "push",
+                },
+              }
+            )
+          )
         );
       })
     );
@@ -1395,6 +1425,7 @@ export const addComment = async (req, res) => {
         })
       )).filter(Boolean);
       if (eligibleMentionedUsers.length) {
+        const senderAvatarUrl = (req.user?.avatarUrl && (String(req.user.avatarUrl).startsWith('http') ? req.user.avatarUrl : null)) || null;
         const previewMedia = Array.isArray(post.media) && post.media.length ? post.media[0] : null;
         const baseMetadata = {
           commentId: comment._id,
@@ -1425,10 +1456,28 @@ export const addComment = async (req, res) => {
           )
         );
 
+        try {
+          const io = getIO();
+          const nowIso = new Date().toISOString();
+          eligibleMentionedUsers.forEach((mentionedUser) => {
+            const recipientId = String(mentionedUser?._id || "");
+            if (!recipientId) return;
+            io.to(`user:${recipientId}`).emit("notify:update", {
+              type: "comment_mention",
+              actorId: String(req.user?._id || ""),
+              actorName: req.user?.nickname || req.user?.name || "Someone",
+              actorAvatarUrl: senderAvatarUrl,
+              message: `${req.user?.name || 'Someone'} mentioned you`,
+              createdAt: nowIso,
+              postId: String(post._id),
+              commentId: String(comment._id),
+            });
+          });
+        } catch {}
+
         // Push mentions (only when recipient is offline)
         try {
           const onlineUsers = getOnlineUsers();
-          const senderAvatarUrl = (req.user?.avatarUrl && (String(req.user.avatarUrl).startsWith('http') ? req.user.avatarUrl : null)) || null;
 
           await Promise.all(
             eligibleMentionedUsers.map(async (mentionedUser) => {
@@ -1437,24 +1486,34 @@ export const addComment = async (req, res) => {
               const socketIds = getSocketIdsForUser(recipientId);
               const isOnline = socketIds.length > 0 || onlineUsers.has(recipientId);
               if (isOnline) return;
-              if (!mentionedUser?.pushToken) return;
-              await sendPushNotification(
-                mentionedUser.pushToken,
-                'Mention',
-                `${req.user.name || 'Someone'} mentioned you`,
-                {
-                  type: 'comment_mention',
-                  postId: String(post._id),
-                  commentId: String(comment._id),
-                  senderId: String(req.user._id),
-                  senderUsername: req.user.nickname || req.user.name || '',
-                  senderAvatarUrl,
-                },
-                {
-                  collapseId: `mention:${String(post._id)}:${recipientId}`,
-                  threadId: `mention:${recipientId}`,
-                  image: senderAvatarUrl,
-                }
+              const targetTokens = listPushTokensFromUser(mentionedUser);
+              if (!targetTokens.length) return;
+              await Promise.all(
+                targetTokens.map((token) =>
+                  sendPushNotification(
+                    token,
+                    'Mention',
+                    `${req.user.name || 'Someone'} mentioned you`,
+                    {
+                      type: 'comment_mention',
+                      postId: String(post._id),
+                      commentId: String(comment._id),
+                      senderId: String(req.user._id),
+                      senderUsername: req.user.nickname || req.user.name || '',
+                      senderAvatarUrl,
+                    },
+                    {
+                      collapseId: `mention:${String(post._id)}:${recipientId}`,
+                      threadId: `mention:${recipientId}`,
+                      image: senderAvatarUrl,
+                      analytics: {
+                        recipientUserId: recipientId,
+                        notificationType: "comment_mention",
+                        source: "push",
+                      },
+                    }
+                  )
+                )
               );
             })
           );

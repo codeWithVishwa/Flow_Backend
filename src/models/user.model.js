@@ -81,6 +81,18 @@ const userSchema = new mongoose.Schema(
     // Push Notifications
     pushToken: { type: String, default: null },
     pushTokenUpdatedAt: { type: Date, default: null },
+    pushTokens: [
+      {
+        token: { type: String, required: true },
+        provider: { type: String, default: "unknown" },
+        platform: { type: String, default: null },
+        deviceId: { type: String, default: null },
+        appVersion: { type: String, default: null },
+        updatedAt: { type: Date, default: Date.now },
+        createdAt: { type: Date, default: Date.now },
+        disabledAt: { type: Date, default: null },
+      },
+    ],
     offlineNotifications: [{
       senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
       count: { type: Number, default: 1 },
@@ -107,6 +119,7 @@ userSchema.index({ followRequests: 1 });
 userSchema.index({ 'messageRequests.from': 1 });
 userSchema.index({ 'savedPosts.post': 1 });
 userSchema.index({ location: "2dsphere" });
+userSchema.index({ "pushTokens.token": 1 });
 
 userSchema.pre('save', function(next) {
   if (this.isModified('name') && typeof this.name === 'string') {

@@ -300,10 +300,18 @@ export function initSocket(server) {
 
       const fromId = String(fromUserId);
       const toId = String(toUserId);
+      if (socketUserId && String(socketUserId) !== fromId) return;
+      if (fromId === toId) return;
       const existingForCallee = userActiveCall.get(toId);
       const existingForCaller = userActiveCall.get(fromId);
       if (existingForCallee || existingForCaller) {
-        socket.emit("call:busy", { callId, toUserId: toId, fromUserId: fromId });
+        socket.emit("call:busy", { callId, toUserId: toId, fromUserId: fromId, reason: "busy" });
+        return;
+      }
+
+      const calleeSocketIds = getSocketIdsForUser(toId);
+      if (!calleeSocketIds.length) {
+        socket.emit("call:busy", { callId, toUserId: toId, fromUserId: fromId, reason: "offline" });
         return;
       }
 
@@ -321,61 +329,66 @@ export function initSocket(server) {
 
     socket.on("call:accept", (payload) => {
       const callId = payload?.callId;
-      const fromUserId = payload?.fromUserId;
-      const toUserId = payload?.toUserId;
-      if (!callId || !fromUserId || !toUserId) return;
+      const fromUserId = socketUserId || payload?.fromUserId;
+      if (!callId || !fromUserId) return;
       const entry = activeCalls.get(String(callId));
       if (!entry) return;
       const fromId = String(fromUserId);
-      const toId = String(toUserId);
-      if (!getOtherParty(entry, fromId)) return;
-      io.to(`user:${toId}`).emit("call:accepted", { callId, fromUserId: fromId, toUserId: toId });
+      const toId = getOtherParty(entry, fromId);
+      if (!toId) return;
+      io.to(`user:${String(toId)}`).emit("call:accepted", { callId, fromUserId: fromId, toUserId: String(toId) });
     });
 
     socket.on("call:reject", (payload) => {
       const callId = payload?.callId;
-      const fromUserId = payload?.fromUserId;
-      const toUserId = payload?.toUserId;
-      if (!callId || !fromUserId || !toUserId) return;
+      const fromUserId = socketUserId || payload?.fromUserId;
+      if (!callId || !fromUserId) return;
       const entry = activeCalls.get(String(callId));
       if (!entry) return;
+      const fromId = String(fromUserId);
+      const toId = getOtherParty(entry, fromId);
+      if (!toId) return;
       clearCall(callId);
-      io.to(`user:${String(toUserId)}`).emit("call:rejected", {
+      io.to(`user:${String(toId)}`).emit("call:rejected", {
         callId,
-        fromUserId: String(fromUserId),
-        toUserId: String(toUserId),
+        fromUserId: fromId,
+        toUserId: String(toId),
       });
     });
 
     socket.on("call:signal", (payload) => {
       const callId = payload?.callId;
-      const fromUserId = payload?.fromUserId;
-      const toUserId = payload?.toUserId;
-      if (!callId || !fromUserId || !toUserId) return;
+      const fromUserId = socketUserId || payload?.fromUserId;
+      if (!callId || !fromUserId) return;
       const entry = activeCalls.get(String(callId));
       if (!entry) return;
       const fromId = String(fromUserId);
       const expectedOther = getOtherParty(entry, fromId);
-      if (!expectedOther || String(expectedOther) !== String(toUserId)) return;
-      io.to(`user:${String(toUserId)}`).emit("call:signal", {
+      if (!expectedOther) return;
+      if (payload?.toUserId && String(payload.toUserId) !== String(expectedOther)) return;
+      io.to(`user:${String(expectedOther)}`).emit("call:signal", {
         callId,
         fromUserId: fromId,
-        toUserId: String(toUserId),
+        toUserId: String(expectedOther),
         data: payload?.data || null,
       });
     });
 
     socket.on("call:end", (payload) => {
       const callId = payload?.callId;
-      const fromUserId = payload?.fromUserId;
-      const toUserId = payload?.toUserId;
-      if (!callId || !fromUserId || !toUserId) return;
+      const fromUserId = socketUserId || payload?.fromUserId;
+      if (!callId || !fromUserId) return;
+      const existingEntry = activeCalls.get(String(callId));
+      if (!existingEntry) return;
+      const fromId = String(fromUserId);
+      const toId = getOtherParty(existingEntry, fromId);
+      if (!toId) return;
       const entry = clearCall(callId);
       if (!entry) return;
-      io.to(`user:${String(toUserId)}`).emit("call:ended", {
+      io.to(`user:${String(toId)}`).emit("call:ended", {
         callId,
-        fromUserId: String(fromUserId),
-        toUserId: String(toUserId),
+        fromUserId: fromId,
+        toUserId: String(toId),
         reason: payload?.reason || "ended",
       });
     });

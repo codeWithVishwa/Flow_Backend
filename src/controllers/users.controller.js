@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import User from "../models/user.model.js";
 import Post from "../models/post.model.js";
 import Notification from "../models/notification.model.js";
+import NotificationEvent from "../models/notificationEvent.model.js";
 import cloudinary from "cloudinary";
 import sharp from "sharp";
 import fs from "fs/promises";
@@ -9,8 +10,8 @@ import path from "path";
 import crypto from "crypto";
 import { getIO } from "../socket.js";
 import { suggestUsernames } from "../utils/nameSuggestions.js";
-import { sendPushNotification } from "../utils/expoPush.js";
 import { getOnlineUsers, getSocketIdsForUser } from "../socket.js";
+import { listPushTokensFromUser, upsertPushTokenRecord } from "../utils/pushTargets.js";
 
 // Lazy Cloudinary configuration so it works even if dotenv loads later
 function ensureCloudinaryConfigured() {
@@ -425,6 +426,57 @@ export const markAllNotificationsRead = async (req, res) => {
   }
 };
 
+function sanitizeEventValue(value, maxLen = 80) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (!normalized) return null;
+  return normalized.slice(0, maxLen);
+}
+
+export const trackNotificationEvent = async (req, res) => {
+  try {
+    const eventType = sanitizeEventValue(req.body?.eventType, 40)?.toLowerCase();
+    const allowedEventTypes = new Set([
+      "sent",
+      "provider_accepted",
+      "delivery_failed",
+      "received",
+      "opened",
+      "action_clicked",
+      "dismissed",
+    ]);
+    if (!eventType || !allowedEventTypes.has(eventType)) {
+      return res.status(400).json({ message: "Invalid eventType" });
+    }
+
+    const source = sanitizeEventValue(req.body?.source, 24)?.toLowerCase() || "push";
+    const notificationType = sanitizeEventValue(req.body?.notificationType, 64)?.toLowerCase() || null;
+    const provider = sanitizeEventValue(req.body?.provider, 24)?.toLowerCase() || null;
+    const actionIdentifier = sanitizeEventValue(req.body?.actionIdentifier, 60) || null;
+    const conversationId = sanitizeEventValue(req.body?.conversationId, 64) || null;
+    const messageId = sanitizeEventValue(req.body?.messageId, 64) || null;
+    const status = sanitizeEventValue(req.body?.status, 64) || null;
+    const metadata = req.body?.metadata && typeof req.body.metadata === "object" ? req.body.metadata : {};
+
+    await NotificationEvent.create({
+      user: req.user._id,
+      eventType,
+      source,
+      notificationType,
+      provider,
+      actionIdentifier,
+      conversationId,
+      messageId,
+      status,
+      metadata,
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+};
+
 export const listContacts = async (req, res) => {
   try {
     const me = await User.findById(req.user._id).select("followers following");
@@ -613,8 +665,11 @@ export const listNearbyUsers = async (req, res) => {
     if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
       return res.status(400).json({ message: "Invalid coordinates" });
     }
-    const viewer = await User.findById(req.user._id).select("_id blockedUsers");
+    const viewer = await User.findById(req.user._id).select("_id blockedUsers allowLocationDiscovery");
     if (!viewer) return res.status(404).json({ message: "User not found" });
+    if (viewer.allowLocationDiscovery === false) {
+      return res.status(403).json({ message: "Enable nearby users in settings to find nearby people" });
+    }
     const viewerId = viewer._id;
     const blockedIds = Array.isArray(viewer.blockedUsers) ? viewer.blockedUsers : [];
     const docs = await User.aggregate([
@@ -652,6 +707,8 @@ export const listNearbyUsers = async (req, res) => {
           nickname: 1,
           avatarUrl: 1,
           isPrivate: 1,
+          location: 1,
+          following: 1,
           distanceMeters: 1,
           viewerIsFollower: { $in: [viewerId, "$followers"] },
           viewerRequested: { $in: [viewerId, "$followRequests"] },
@@ -981,7 +1038,7 @@ export const recommendFriends = async (req, res) => {
 
 export const updatePushToken = async (req, res) => {
   try {
-    const { token } = req.body;
+    const { token, provider, deviceId, platform, appVersion } = req.body;
     if (!token || typeof token !== 'string') return res.status(400).json({ message: "Token required" });
 
     const now = new Date();
@@ -990,22 +1047,44 @@ export const updatePushToken = async (req, res) => {
     // If the same device logs into a different account, we must move the token.
     // Otherwise pushes can go to the wrong user (exact issue reported).
     const dedupeRes = await User.updateMany(
-      { pushToken: token, _id: { $ne: req.user._id } },
-      { $unset: { pushToken: 1, pushTokenUpdatedAt: 1 } }
+      {
+        _id: { $ne: req.user._id },
+        $or: [{ pushToken: token }, { "pushTokens.token": token }],
+      },
+      {
+        $unset: { pushToken: 1, pushTokenUpdatedAt: 1 },
+        $pull: { pushTokens: { token } },
+      }
     ).catch(() => null);
 
-    const updated = await User.findByIdAndUpdate(
-      req.user._id,
-      { pushToken: token, pushTokenUpdatedAt: now },
-      { new: true }
-    ).select("_id pushToken pushTokenUpdatedAt");
+    const updated = await User.findById(req.user._id).select("_id pushToken pushTokenUpdatedAt pushTokens");
+    if (!updated) return res.status(404).json({ message: "User not found" });
+
+    updated.pushToken = token;
+    updated.pushTokenUpdatedAt = now;
+    updated.pushTokens = upsertPushTokenRecord(updated.pushTokens, {
+      token,
+      provider,
+      deviceId,
+      platform,
+      appVersion,
+      updatedAt: now,
+    });
+    await updated.save();
+
+    const allTokens = listPushTokensFromUser(updated);
 
     // Helpful server log for debugging token freshness (don’t print full token)
     const tokenSuffix = typeof token === 'string' ? token.slice(-12) : '';
     const moved = dedupeRes && typeof dedupeRes.modifiedCount === 'number' ? dedupeRes.modifiedCount : null;
     console.log(`[push] token updated user=${String(req.user._id)} suffix=${tokenSuffix} movedFromOthers=${moved} at=${now.toISOString()}`);
 
-    res.json({ ok: true, pushTokenUpdatedAt: updated?.pushTokenUpdatedAt || now });
+    res.json({
+      ok: true,
+      pushTokenUpdatedAt: updated.pushTokenUpdatedAt || now,
+      tokenCount: allTokens.length,
+      tokenSuffixes: allTokens.map((entry) => String(entry).slice(-12)),
+    });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
@@ -1013,10 +1092,30 @@ export const updatePushToken = async (req, res) => {
 
 export const clearPushToken = async (req, res) => {
   try {
+    const token =
+      typeof req.body?.token === "string" && req.body.token.trim()
+        ? req.body.token.trim()
+        : null;
     const now = new Date();
+    if (token) {
+      await User.findByIdAndUpdate(
+        req.user._id,
+        {
+          $pull: { pushTokens: { token } },
+        },
+        { new: false }
+      );
+      await User.updateOne(
+        { _id: req.user._id, pushToken: token },
+        { $unset: { pushToken: 1, pushTokenUpdatedAt: 1 } }
+      ).catch(() => {});
+      console.log(`[push] specific token cleared user=${String(req.user._id)} suffix=${token.slice(-12)} at=${now.toISOString()}`);
+      return res.json({ ok: true, cleared: "single" });
+    }
+
     await User.findByIdAndUpdate(
       req.user._id,
-      { $unset: { pushToken: 1, pushTokenUpdatedAt: 1 } },
+      { $unset: { pushToken: 1, pushTokenUpdatedAt: 1 }, $set: { pushTokens: [] } },
       { new: false }
     );
 
@@ -1029,13 +1128,16 @@ export const clearPushToken = async (req, res) => {
 
 export const getMyPushTokenStatus = async (req, res) => {
   try {
-    const me = await User.findById(req.user._id).select("_id pushToken pushTokenUpdatedAt").lean();
+    const me = await User.findById(req.user._id).select("_id pushToken pushTokenUpdatedAt pushTokens").lean();
     if (!me) return res.status(404).json({ message: "User not found" });
 
-    const token = me.pushToken || null;
+    const tokens = listPushTokensFromUser(me);
+    const token = tokens[0] || null;
     res.json({
-      hasToken: Boolean(token),
+      hasToken: tokens.length > 0,
+      tokenCount: tokens.length,
       tokenSuffix: token ? String(token).slice(-12) : null,
+      tokenSuffixes: tokens.map((entry) => String(entry).slice(-12)),
       pushTokenUpdatedAt: me.pushTokenUpdatedAt || null,
     });
   } catch (e) {
@@ -1067,6 +1169,7 @@ export const deactivateAccount = async (req, res) => {
     user.deactivatedAt = new Date();
     user.pushToken = null;
     user.pushTokenUpdatedAt = null;
+    user.pushTokens = [];
     user.refreshTokens = [];
 
     await user.save();
@@ -1111,6 +1214,7 @@ export const deleteAccount = async (req, res) => {
     user.profileLikes = [];
     user.pushToken = null;
     user.pushTokenUpdatedAt = null;
+    user.pushTokens = [];
     user.refreshTokens = [];
 
     await user.save();
