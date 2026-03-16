@@ -11,7 +11,7 @@ const onlineUsers = new Set();
 const pendingOfflineTimers = new Map();
 const PRESENCE_OFFLINE_GRACE_MS = 12000;
 const pendingCallDisconnectTimers = new Map();
-const CALL_DISCONNECT_GRACE_MS = 10000;
+const CALL_DISCONNECT_GRACE_MS = 20000;
 
 // Active audio call tracking (in-memory)
 const activeCalls = new Map(); // callId -> { callerId, calleeId, createdAt }
